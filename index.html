@@ -1985,6 +1985,337 @@ window.AlphaService = (() => {
 })();
 </script>
 
+
+<script>
+/* =============================================================
+   PHASE 20B — REAL GAMEPLAY BRIDGE V1
+   Supabase Alpha is the source of truth. No service-role key here.
+   ============================================================= */
+window.RealGameService = (() => {
+  const client = window.AlphaService.client;
+  const cache = { ctx:null, ctxAt:0, squad:null, squadAt:0 };
+  const TTL = 2500;
+
+  function must(result, label='SUPABASE_ERROR') {
+    if (result?.error) {
+      const e = result.error;
+      const msg = [e.message, e.details, e.hint, e.code].filter(Boolean).join(' | ');
+      throw new Error(`${label}: ${msg || 'Unknown Supabase error'}`);
+    }
+    return result?.data;
+  }
+  const cap = s => String(s ?? '').trim();
+  const num = (v, d=0) => Number.isFinite(Number(v)) ? Number(v) : d;
+  const title = s => cap(s).toLowerCase().replace(/\b\w/g, m=>m.toUpperCase());
+  const pressToServer = v => v === 'High Press' ? 'High' : v === 'Very High Press' ? 'Very High' : v;
+  const pressToUi = v => v === 'High' ? 'High Press' : v === 'Very High' ? 'Very High Press' : v;
+  const focusToServer = v => {
+    if (!v || v === 'Balanced') return null;
+    const map = {'Work Rate':'work_rate','One-on-One':'one_on_one'};
+    return map[v] || String(v).toLowerCase().replaceAll(' ','_').replaceAll('-','_');
+  };
+  const prettyCategory = c => ({MATCH:'Match',TRANSFER:'Transfer',PLAYER:'Player',FINANCE:'Finance',LEAGUE:'League'}[c] || title(c));
+  const fmtWib = ts => {
+    if (!ts) return 'TBD';
+    try { return new Intl.DateTimeFormat('id-ID',{timeZone:'Asia/Jakarta',hour:'2-digit',minute:'2-digit',hour12:false}).format(new Date(ts))+' WIB'; }
+    catch { return cap(ts); }
+  };
+  const fmtDate = ts => {
+    if (!ts) return 'TBD';
+    try { return new Intl.DateTimeFormat('id-ID',{timeZone:'Asia/Jakarta',day:'2-digit',month:'short'}).format(new Date(ts)); }
+    catch { return cap(ts); }
+  };
+  const relative = ts => {
+    if (!ts) return '';
+    const diff = Date.now()-new Date(ts).getTime();
+    if (!Number.isFinite(diff)) return '';
+    const m=Math.max(0,Math.floor(diff/60000));
+    if (m<1) return 'Now'; if (m<60) return `${m}m`; const h=Math.floor(m/60); if(h<24)return `${h}h`; return `${Math.floor(h/24)}d`;
+  };
+  function invalidate() { cache.ctx=null; cache.squad=null; cache.ctxAt=cache.squadAt=0; }
+
+  async function context(force=false) {
+    if (!force && cache.ctx && Date.now()-cache.ctxAt<TTL) return cache.ctx;
+    const session = await AlphaService.getSession();
+    if (!session?.user) throw new Error('AUTH_REQUIRED');
+    const [profile, world] = await Promise.all([
+      AlphaService.getProfile(session.user.id), AlphaService.getWorld()
+    ]);
+    if (!profile || profile.approval_status !== 'approved') throw new Error('ACCOUNT_NOT_APPROVED');
+    const club = await AlphaService.getMyClub(session.user.id);
+    if (!club) throw new Error('CLUB_NOT_FOUND_FOR_MANAGER');
+    const season = must(await client.from('seasons').select('*').eq('world_id',world.id).eq('season_number',world.current_season_number).maybeSingle(),'SEASON');
+    if (!season) throw new Error('CURRENT_SEASON_NOT_FOUND');
+    cache.ctx = {session,profile,world,club,season}; cache.ctxAt=Date.now();
+    return cache.ctx;
+  }
+
+  async function clubMap(worldId) {
+    const rows = must(await client.from('clubs').select('id,name,short_name,stadium_name,manager_id,reputation,active').eq('world_id',worldId).eq('active',true),'CLUBS') || [];
+    return new Map(rows.map(x=>[x.id,x]));
+  }
+
+  async function getManager() {
+    const {profile} = await context();
+    const n = profile.display_name || profile.username || 'Manager';
+    return {id:profile.id,name:n,short:n.split(/\s+/).slice(0,2).map(x=>x[0]).join('').toUpperCase(),status:profile.approval_status,role:profile.role};
+  }
+  async function getSeason(){ const {season}=await context(); return {number:season.season_number,phase:season.phase,matchday:season.matchday,id:season.id}; }
+
+  async function getSquad(force=false) {
+    const {club,season} = await context();
+    if (!force && cache.squad && Date.now()-cache.squadAt<TTL) return JSON.parse(JSON.stringify(cache.squad));
+    const states = must(await client.from('player_state').select('*').eq('current_club_id',club.id).eq('ownership_status','owned').order('current_ovr',{ascending:false}),'SQUAD_STATE') || [];
+    if (!states.length) return [];
+    const ids=states.map(x=>x.player_id);
+    const [playersR, contractsR, attrsR, posR, injuriesR, suspR, statsR, transR] = await Promise.all([
+      client.from('players').select('*').in('id',ids),
+      client.from('contracts').select('*').in('player_id',ids).eq('club_id',club.id).eq('status','active'),
+      client.from('player_current_attributes').select('*').in('player_id',ids),
+      client.from('player_position_ratings').select('*').in('player_id',ids),
+      client.from('player_injuries').select('*').in('player_id',ids).eq('status','active'),
+      client.from('player_suspensions').select('*').in('player_id',ids).eq('season_id',season.id).eq('status','active'),
+      client.from('player_season_stats').select('*').in('player_id',ids).eq('season_id',season.id),
+      client.from('player_transfer_state').select('*').in('player_id',ids)
+    ]);
+    const players=must(playersR,'PLAYERS')||[], contracts=must(contractsR,'CONTRACTS')||[], attrs=must(attrsR,'ATTRS')||[], pos=must(posR,'POS_RATINGS')||[], injuries=must(injuriesR,'INJURIES')||[], susp=must(suspR,'SUSPENSIONS')||[], stats=must(statsR,'STATS')||[], trs=must(transR,'TRANSFER_STATE')||[];
+    const by=(arr,key='player_id')=>new Map(arr.map(x=>[x[key],x]));
+    const pBy=by(players,'id'), cBy=by(contracts), aBy=by(attrs), iBy=by(injuries), sBy=by(susp), stBy=by(stats), trBy=by(trs);
+    const posBy=new Map(); for(const x of pos){if(!posBy.has(x.player_id))posBy.set(x.player_id,[]);posBy.get(x.player_id).push(x)}
+    const attrsNames={pace:'Pace',acceleration:'Acceleration',finishing:'Finishing',passing:'Passing',dribbling:'Dribbling',crossing:'Crossing',tackling:'Tackling',positioning:'Positioning',strength:'Strength',aerial:'Aerial',stamina:'Stamina',work_rate:'Work Rate',reflexes:'Reflexes',handling:'Handling',one_on_one:'One-on-One',distribution:'Distribution'};
+    const out=states.map(s=>{
+      const p=pBy.get(s.player_id)||{}, c=cBy.get(s.player_id)||{}, a=aBy.get(s.player_id)||{}, inj=iBy.get(s.player_id), su=sBy.get(s.player_id), st=stBy.get(s.player_id)||{}, tr=trBy.get(s.player_id)||{};
+      const attributes={}; for(const [k,label] of Object.entries(attrsNames)){ if(a[k]!=null) attributes[label]=a[k]; }
+      let positionOvrs=(posBy.get(s.player_id)||[]).map(r=>({position:r.position,ovr:r.position===p.primary_position?s.current_ovr:r.ovr,familiarity:r.familiarity}));
+      if(!positionOvrs.length) positionOvrs=[{position:p.primary_position,ovr:s.current_ovr,familiarity:'Natural'}];
+      const injury = inj ? {level:inj.severity,matchesAffected:inj.recovery_days,playable:!['Heavy','Very Heavy'].includes(inj.severity),returnFitness:s.fitness} : {level:'None',matchesAffected:0,playable:true,returnFitness:s.fitness};
+      const suspension = su ? {active:true,matches:su.matches_remaining} : {active:false,matches:0};
+      const status = suspension.active ? `Suspended (${suspension.matches})` : injury.level!=='None' ? `Injured · ${injury.level}` : 'Available';
+      const refAge=p.reference_age ?? s.current_age;
+      const careerStage=refAge<=23?'Developing':refAge<=29?'Peak Age':'Veteran';
+      const sec=cap(p.secondary_positions)||'-';
+      return {
+        id:s.player_id,name:p.name||s.player_id,pos:p.primary_position||'?',secondary:sec,ovr:s.current_ovr,age:s.current_age,fitness:Math.round(num(s.fitness,100)),form:Math.round(num(s.form,50)),potential:p.potential_label||'Moderate',tier:s.current_tier,contract:c.seasons_remaining??0,wage:c.weekly_wage??0,status,
+        refSeason:p.reference_season||'-',refClub:p.reference_club||'-',refAge,careerStage,attributes,injury,suspension,retirementRisk:s.retirement_risk||'Low',resaleCooldown:Math.max(0,num(s.resale_eligible_matchday)-num(season.matchday)),positionOvrs,
+        stats:{appearances:st.appearances||0,starts:st.starts||0,minutes:st.minutes||0,goals:st.goals||0,assists:st.assists||0,cleanSheets:st.clean_sheets||0,avgRating:st.average_rating==null?'-':Number(st.average_rating).toFixed(2)},
+        careerHistory:[{season:`Season ${season.season_number}`,club:club.name,apps:st.appearances||0,goals:st.goals||0,assists:st.assists||0,rating:st.average_rating==null?'-':Number(st.average_rating).toFixed(2)}],
+        transferState:tr, renewal:{seasons:c.renewal_seasons??null,wage:c.renewal_weekly_wage??null}
+      };
+    });
+    cache.squad=out; cache.squadAt=Date.now(); return JSON.parse(JSON.stringify(out));
+  }
+  async function getPlayerById(id){ const s=await getSquad(); return s.find(x=>x.id===id)||null; }
+
+  async function recentForm(clubId, seasonId) {
+    const fixtures = must(await client.from('league_fixtures').select('id,home_club_id,away_club_id,matchday,status').eq('season_id',seasonId).eq('status','completed').or(`home_club_id.eq.${clubId},away_club_id.eq.${clubId}`).order('matchday',{ascending:false}).limit(5),'FORM_FIXTURES') || [];
+    if(!fixtures.length)return [];
+    const results=must(await client.from('league_match_results').select('*').in('fixture_id',fixtures.map(x=>x.id)),'FORM_RESULTS')||[];
+    const rBy=new Map(results.map(x=>[x.fixture_id,x]));
+    return fixtures.map(f=>{const r=rBy.get(f.id);if(!r)return 'D';const home=f.home_club_id===clubId;const gf=home?r.home_score:r.away_score,ga=home?r.away_score:r.home_score;return gf>ga?'W':gf<ga?'L':'D'});
+  }
+
+  async function getClub(){
+    const {club,season}=await context();
+    const [csR, stR, squad, form] = await Promise.all([
+      client.from('club_seasons').select('*').eq('club_id',club.id).eq('season_id',season.id).maybeSingle(),
+      client.from('league_standings').select('*').eq('club_id',club.id).eq('season_id',season.id).maybeSingle(),
+      getSquad(), recentForm(club.id,season.id)
+    ]);
+    const cs=must(csR,'CLUB_SEASON')||{}, st=must(stR,'STANDING')||{};
+    const avg=arr=>arr.length?Math.round(arr.reduce((a,b)=>a+b,0)/arr.length):0;
+    const attack=avg(squad.filter(p=>['ST','RW','LW','AM'].includes(p.pos)).map(p=>p.ovr));
+    const midfield=avg(squad.filter(p=>['DM','CM','AM'].includes(p.pos)).map(p=>p.ovr));
+    const defense=avg(squad.filter(p=>['RB','CB','LB','RWB','LWB'].includes(p.pos)).map(p=>p.ovr));
+    return {id:club.id,name:club.name,shortName:club.short_name,stadium:club.stadium_name,leaguePosition:st.position||'-',balance:cs.balance||0,transferBudget:cs.transfer_budget||0,wageUsed:cs.weekly_wage_committed||0,wageLimit:cs.wage_limit_weekly||1200000,reputation:`${club.reputation}`,form,strength:{attack,midfield,defense},transferSpendingFrozen:!!cs.transfer_spending_frozen,financeStatus:cs.finance_status||'healthy'};
+  }
+
+  async function getNextFixture(){
+    const {club,season,world}=await context();
+    const rows=must(await client.from('league_fixtures').select('*').eq('season_id',season.id).in('status',['scheduled','lineup_locked','live']).or(`home_club_id.eq.${club.id},away_club_id.eq.${club.id}`).order('matchday',{ascending:true}).order('scheduled_kickoff',{ascending:true}).limit(1),'NEXT_FIXTURE')||[];
+    const f=rows[0]; const cmap=await clubMap(world.id);
+    if(!f) return {id:null,home:{name:club.name,short:club.short_name},away:{name:'TBD',short:'TBD'},dateLabel:'No scheduled fixture',kickoff:'TBD',window:'Scheduler OFF / TBD',venue:club.stadium_name};
+    const h=cmap.get(f.home_club_id)||{}, a=cmap.get(f.away_club_id)||{};
+    const windowLabel=f.kickoff_window==='ODD_19_30_21_00'?'19:30–21:00 WIB':'22:00–23:30 WIB';
+    return {id:f.id,home:{name:h.name||'Home',short:h.short_name||'H'},away:{name:a.name||'Away',short:a.short_name||'A'},dateLabel:`Matchday ${f.matchday}`,kickoff:fmtWib(f.scheduled_kickoff),window:windowLabel,venue:h.stadium_name||'Home Stadium',status:f.status,scheduledKickoff:f.scheduled_kickoff};
+  }
+
+  async function getNotifications(){
+    const data=must(await client.rpc('notification_feed',{p_category:null,p_unread_only:false,p_limit:100,p_before:null}),'NOTIFICATIONS')||{};
+    return (data.items||[]).map(n=>({id:n.id,category:prettyCategory(n.category),title:n.title,message:n.body,time:relative(n.created_at),read:!!n.is_read,actionKey:n.action_key,createdAt:n.created_at}));
+  }
+  async function getRecentActivities(){
+    const notes=await getNotifications();
+    return notes.slice(0,5).map(n=>({icon:{Match:'▶',Transfer:'£',Player:'XI',Finance:'$',League:'LG'}[n.category]||'i',title:n.title,detail:n.message,time:n.time}));
+  }
+
+  async function getSavedSetup(){
+    const {club,season}=await context();
+    const [tR,lR,eR]=await Promise.all([
+      client.from('club_tactics').select('*').eq('club_id',club.id).eq('season_id',season.id).maybeSingle(),
+      client.from('club_lineups').select('*').eq('club_id',club.id).eq('season_id',season.id).maybeSingle(),
+      client.from('club_lineup_entries').select('*').eq('club_id',club.id).eq('season_id',season.id).order('role').order('slot_index')
+    ]);
+    return {tactics:must(tR,'TACTICS_READ'),lineup:must(lR,'LINEUP_READ'),entries:must(eR,'LINEUP_ENTRIES')||[]};
+  }
+  async function hydrateUIState(state){
+    const setup=await getSavedSetup();
+    if(setup.tactics){
+      const t=setup.tactics;
+      state.tactics.formation=t.formation_code||state.tactics.formation;
+      state.tactics.mentality=t.mentality||'Balanced'; state.tactics.pressing=pressToUi(t.press||'Standard'); state.tactics.defensiveLine=t.defensive_line||'Standard'; state.tactics.tempo=t.tempo||'Balanced'; state.tactics.passingStyle=t.passing_style||'Mixed'; state.tactics.width=t.width||'Balanced'; state.tactics.attackFocus=t.focus||'Balanced'; state.tactics.transition=t.transition||'Balanced'; state.tactics.autoSubEnabled=t.auto_sub_enabled!==false;
+    }
+    const starters=setup.entries.filter(x=>x.role==='starter').sort((a,b)=>a.slot_index-b.slot_index);
+    const bench=setup.entries.filter(x=>x.role==='bench').sort((a,b)=>a.slot_index-b.slot_index);
+    if(starters.length===11){ state.lineup={}; starters.forEach((x,i)=>state.lineup[i]=x.player_id); state.bench=bench.map(x=>x.player_id); }
+    return setup;
+  }
+  async function saveTactics(t){
+    const data=must(await client.rpc('save_tactics',{p_formation_code:t.formation,p_mentality:t.mentality,p_press:pressToServer(t.pressing),p_defensive_line:t.defensiveLine,p_tempo:t.tempo,p_passing_style:t.passingStyle,p_width:t.width,p_focus:t.attackFocus,p_transition:t.transition,p_auto_sub_enabled:t.autoSubEnabled!==false}),'SAVE_TACTICS'); invalidate(); return data;
+  }
+  async function saveLineup(formation,starters,bench){ const data=must(await client.rpc('save_lineup',{p_formation_code:formation,p_starters:starters,p_bench:bench}),'SAVE_LINEUP'); invalidate(); return data; }
+
+  async function getLineupRules(){
+    const {club,season}=await context();
+    const [lockR,tR]=await Promise.all([
+      client.from('lineup_locks').select('*').eq('club_id',club.id).eq('season_id',season.id).maybeSingle(),
+      client.from('club_tactics').select('auto_sub_enabled').eq('club_id',club.id).eq('season_id',season.id).maybeSingle()
+    ]);
+    const lock=must(lockR,'LINEUP_LOCK'), t=must(tR,'TACTICS_RULES'); const locked=!!(lock?.active && new Date(lock.lock_at)<=new Date());
+    let countdown='Not scheduled'; if(lock?.lock_at){const sec=Math.max(0,Math.floor((new Date(lock.lock_at)-Date.now())/1000));countdown=`${Math.floor(sec/60)}:${String(sec%60).padStart(2,'0')}`;}
+    return {lockMinutesBeforeKickoff:5,currentlyLocked:locked,lockCountdown:countdown,offlineFallback:'Last Valid Lineup + Last Valid Tactics',autoSubEnabled:t?.auto_sub_enabled!==false,autoSubRules:{fatigueThreshold:68,injuryRiskReplacement:true,preserveFormation:true,maxSubs:5}};
+  }
+
+  async function getTrainingState(){
+    const {club}=await context(); const today=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Jakarta'}).format(new Date());
+    const [sessR,facR]=await Promise.all([
+      client.from('training_sessions').select('*').eq('club_id',club.id).eq('training_date',today).maybeSingle(),
+      client.from('club_facilities').select('*').eq('club_id',club.id).maybeSingle()
+    ]);
+    const s=must(sessR,'TRAINING_TODAY'), f=must(facR,'FACILITIES')||{};
+    return {todayType:s?.session_type||'Normal',teamFocus:'Balanced',completed:s?.status==='completed',scheduled:s?.status==='scheduled',trainingCentreLevel:f.training_level||1,medicalCentreLevel:f.medical_level||1,sessionsRemainingToday:s?.status==='completed'?0:1,lastSession:s?{type:s.session_type,focus:'Server',result:s.status,note:`Server session ${s.status}`} : null};
+  }
+  async function getTrainingHistory(){
+    const {club}=await context(); const rows=must(await client.from('training_sessions').select('*').eq('club_id',club.id).order('training_date',{ascending:false}).limit(8),'TRAINING_HISTORY')||[];
+    const fitnessDelta={Recovery:10,Light:3,Normal:-2,Intensive:-6,Attacking:-3,Defensive:-3,Technical:-3,Fitness:-5};
+    return rows.map(x=>({day:fmtDate(x.training_date),type:x.session_type,focus:x.session_type,avgDxp:x.players_processed?Math.round(num(x.total_effective_dxp)/Math.max(1,x.players_processed)):0,avgFitness:fitnessDelta[x.session_type]??0,status:x.status}));
+  }
+  async function scheduleTraining(type){ const data=must(await client.rpc('schedule_training',{p_session_type:type,p_training_date:null}),'SCHEDULE_TRAINING'); invalidate(); return data; }
+  async function setIndividualFocus(playerId,label){ return must(await client.rpc('set_individual_focus',{p_player_id:playerId,p_attribute:focusToServer(label)}),'SET_FOCUS'); }
+
+  async function getTransferMarket(){
+    const {club,season,world}=await context(); const cmap=await clubMap(world.id); const squad=await getSquad();
+    const [listR, offersR, aucR, bidsR, statesR] = await Promise.all([
+      client.from('transfer_listings').select('*').eq('status','listed').order('listed_at',{ascending:false}),
+      client.from('transfer_offers').select('*').order('created_at',{ascending:false}),
+      client.from('free_agent_auctions').select('*').eq('world_id',world.id).eq('status','open').order('ends_at',{ascending:true}),
+      client.from('free_agent_bids').select('*').order('updated_at',{ascending:false}),
+      client.from('player_state').select('*').in('ownership_status',['owned','free_agent'])
+    ]);
+    const listings=must(listR,'LISTINGS')||[], offers=must(offersR,'OFFERS')||[], auctions=must(aucR,'AUCTIONS')||[], bids=must(bidsR,'FA_BIDS')||[], allStates=must(statesR,'PLAYER_STATES')||[];
+    const ids=[...new Set([...listings.map(x=>x.player_id),...offers.map(x=>x.player_id),...auctions.map(x=>x.player_id)])];
+    const [pR,cR] = ids.length ? await Promise.all([client.from('players').select('*').in('id',ids),client.from('contracts').select('*').in('player_id',ids).eq('status','active')]) : [{data:[]},{data:[]}];
+    const players=must(pR,'MARKET_PLAYERS')||[], contracts=must(cR,'MARKET_CONTRACTS')||[]; const pBy=new Map(players.map(x=>[x.id,x])); const cBy=new Map(contracts.map(x=>[x.player_id,x])); const sBy=new Map(allStates.map(x=>[x.player_id,x]));
+    const transferList=listings.filter(x=>x.seller_club_id!==club.id).map(l=>{const p=pBy.get(l.player_id)||{},s=sBy.get(l.player_id)||{},c=cBy.get(l.player_id)||{}; const seller=cmap.get(l.seller_club_id)||{};return {id:l.player_id,listingId:l.id,name:p.name||l.player_id,club:seller.name||'Unknown Club',clubId:l.seller_club_id,pos:p.primary_position||'?',secondary:p.secondary_positions||'-',ovr:s.current_ovr||p.initial_ovr||0,age:s.current_age||p.reference_age||0,fitness:Math.round(num(s.fitness,100)),potential:p.potential_label||'Moderate',tier:s.current_tier||p.initial_tier||'D',price:l.asking_price,wage:c.weekly_wage||0,contract:c.seasons_remaining||1};});
+    const freeAgents=auctions.map(a=>{const p=pBy.get(a.player_id)||{},s=sBy.get(a.player_id)||{};const bb=bids.filter(b=>b.auction_id===a.id).sort((x,y)=>y.signing_bonus-x.signing_bonus)[0];return {id:a.id,playerId:a.player_id,name:p.name||a.player_id,pos:p.primary_position||'?',secondary:p.secondary_positions||'-',ovr:s.current_ovr||p.initial_ovr||0,age:s.current_age||p.reference_age||0,tier:s.current_tier||p.initial_tier||'D',wage:bb?.weekly_wage||20000,currentBid:bb?.signing_bonus||0,currentBidder:bb?cmap.get(bb.club_id)?.name||'Club':'No bids',openingBid:1000000,endsIn:relative(a.ends_at),endsAt:a.ends_at};});
+    const directMine=offers.filter(o=>o.buyer_club_id===club.id).map(o=>({id:o.id,type:'Direct Offer',player:pBy.get(o.player_id)?.name||o.player_id,club:cmap.get(o.seller_club_id)?.name||'Seller',amount:o.seller_counter_amount??o.buyer_amount,status:title(o.status),submitted:relative(o.created_at)}));
+    const myFa=bids.filter(b=>b.club_id===club.id).map(b=>({id:b.id,type:'FA Auction',player:pBy.get(auctions.find(a=>a.id===b.auction_id)?.player_id)?.name||'Free Agent',club:'Free Agent',amount:b.signing_bonus,status:'Bid',submitted:relative(b.updated_at)}));
+    const offersReceived=offers.filter(o=>o.seller_club_id===club.id && ['pending','countered'].includes(o.status)).map(o=>({id:o.id,playerId:o.player_id,player:pBy.get(o.player_id)?.name||o.player_id,buyer:cmap.get(o.buyer_club_id)?.name||'Buyer',amount:o.buyer_amount,status:title(o.status),submitted:relative(o.created_at),counterAmount:o.seller_counter_amount}));
+    return {windowOpen:!!world.transfer_window_open,windowLabel:`${season.phase} Window`,closesIn:world.transfer_window_open?'Open by phase':'Closed',squadSize:squad.length,squadMin:18,squadMax:25,transferList,freeAgents,myBids:[...directMine,...myFa],offersReceived};
+  }
+  async function listPlayerForTransfer(playerId,askingPrice){ const d=must(await client.rpc('list_player_for_transfer',{p_player_id:playerId,p_asking_price:Math.round(askingPrice)}),'LIST_PLAYER'); invalidate(); return d; }
+  async function makeTransferOffer(playerId,amount,wage){ const d=must(await client.rpc('make_transfer_offer',{p_player_id:playerId,p_amount:Math.round(amount),p_weekly_wage:Math.round(wage)}),'MAKE_OFFER'); invalidate(); return d; }
+  async function respondTransferOffer(offerId,action,counter=null){ const d=must(await client.rpc('respond_transfer_offer',{p_offer_id:offerId,p_action:action,p_counter_amount:counter==null?null:Math.round(counter)}),'RESPOND_OFFER'); invalidate(); return d; }
+  async function placeFreeAgentBid(auctionId,bonus,wage,years=2){ const d=must(await client.rpc('place_free_agent_bid',{p_auction_id:auctionId,p_signing_bonus:Math.round(bonus),p_weekly_wage:Math.round(wage),p_contract_seasons:years}),'FA_BID'); invalidate(); return d; }
+
+  async function getLeague(){
+    const {season,world}=await context(); const cmap=await clubMap(world.id);
+    const [stR,fxR,resR,psR] = await Promise.all([
+      client.from('league_standings').select('*').eq('season_id',season.id).order('position',{ascending:true}),
+      client.from('league_fixtures').select('*').eq('season_id',season.id).order('matchday',{ascending:false}).order('scheduled_kickoff',{ascending:false}),
+      client.from('league_match_results').select('*'),
+      client.from('player_season_stats').select('*').eq('season_id',season.id).order('goals',{ascending:false}).order('assists',{ascending:false}).limit(30)
+    ]);
+    const standings=must(stR,'STANDINGS')||[], fixturesRaw=must(fxR,'FIXTURES')||[], results=must(resR,'RESULTS')||[], stats=must(psR,'SEASON_STATS')||[]; const resultBy=new Map(results.map(x=>[x.fixture_id,x]));
+    const standingsOut=standings.map(r=>({pos:r.position||'-',club:cmap.get(r.club_id)?.name||'Club',p:r.played,w:r.won,d:r.drawn,l:r.lost,gf:r.goals_for,ga:r.goals_against,gd:r.goal_difference,pts:r.points,form:[]}));
+    // derive last-five form per club from completed fixtures
+    for(const row of standingsOut){ const club=[...cmap.values()].find(c=>c.name===row.club); if(club)row.form=await recentForm(club.id,season.id); }
+    const fixtures=fixturesRaw.map(f=>{const r=resultBy.get(f.id); return {md:f.matchday,date:fmtDate(f.scheduled_kickoff),home:cmap.get(f.home_club_id)?.name||'Home',away:cmap.get(f.away_club_id)?.name||'Away',time:fmtWib(f.scheduled_kickoff).replace(' WIB',''),status:f.status==='completed'?'FINISHED':String(f.status||'scheduled').toUpperCase(),score:r?`${r.home_score}–${r.away_score}`:null};});
+    const ids=stats.map(x=>x.player_id); const pR=ids.length?await client.from('players').select('id,name,primary_position').in('id',ids):{data:[]}; const players=must(pR,'STAT_PLAYERS')||[]; const pBy=new Map(players.map(x=>[x.id,x])); const statesR=ids.length?await client.from('player_state').select('player_id,current_club_id').in('player_id',ids):{data:[]}; const states=must(statesR,'STAT_STATE')||[];const stateBy=new Map(states.map(x=>[x.player_id,x]));
+    const playerStats=stats.map((s,i)=>({rank:i+1,name:pBy.get(s.player_id)?.name||s.player_id,club:cmap.get(stateBy.get(s.player_id)?.current_club_id)?.name||'-',pos:pBy.get(s.player_id)?.primary_position||'?',goals:s.goals||0,assists:s.assists||0,rating:s.average_rating==null?'-':Number(s.average_rating).toFixed(2)}));
+    return {name:'Private Premier Manager League',seasonNumber:season.season_number,matchday:season.matchday,phase:season.phase,myClubName:(await context()).club.name,clubCount:cmap.size,standings:standingsOut,fixtures,playerStats};
+  }
+
+  async function getMatchCentre(){
+    const {club,season,world}=await context(); const cmap=await clubMap(world.id);
+    let fs=must(await client.from('league_fixtures').select('*').eq('season_id',season.id).or(`home_club_id.eq.${club.id},away_club_id.eq.${club.id}`).in('status',['live','lineup_locked','scheduled','completed']).limit(50),'MATCH_FIXTURES')||[];
+    const liveFixture=fs.find(x=>x.status==='live');
+    const upcomingFixtures=fs.filter(x=>['lineup_locked','scheduled'].includes(x.status)).sort((a,b)=>num(a.matchday)-num(b.matchday) || new Date(a.scheduled_kickoff||0)-new Date(b.scheduled_kickoff||0));
+    const completedFixtures=fs.filter(x=>x.status==='completed').sort((a,b)=>num(b.matchday)-num(a.matchday) || new Date(b.scheduled_kickoff||0)-new Date(a.scheduled_kickoff||0));
+    let f=liveFixture||upcomingFixtures[0]||completedFixtures[0]||null;
+    if(!f) return {fixtureId:null,home:club.name,away:'TBD',homeShort:club.short_name,awayShort:'TBD',kickoff:'TBD',venue:club.stadium_name,status:'NO_FIXTURE',minute:0,homeScore:0,awayScore:0,possessionHome:50,shotsHome:0,shotsAway:0,sotHome:0,sotAway:0,xgHome:0,xgAway:0,events:[{minute:0,type:'info',text:'No fixture scheduled.'}],playerRatings:[]};
+    const [liveR,resultR,eventsR,statsR]=await Promise.all([
+      client.from('live_match_sessions').select('*').eq('fixture_id',f.id).maybeSingle(),
+      client.from('league_match_results').select('*').eq('fixture_id',f.id).maybeSingle(),
+      client.from('live_match_events').select('*').eq('fixture_id',f.id).order('sequence',{ascending:true}),
+      client.from('player_match_stats').select('*').eq('fixture_id',f.id).order('rating',{ascending:false})
+    ]);
+    const live=must(liveR,'LIVE_SESSION'), result=must(resultR,'MATCH_RESULT'), events=must(eventsR,'LIVE_EVENTS')||[], stats=must(statsR,'MATCH_STATS')||[]; const h=cmap.get(f.home_club_id)||{},a=cmap.get(f.away_club_id)||{};
+    const ids=stats.map(x=>x.player_id);const pR=ids.length?await client.from('players').select('id,name,primary_position').in('id',ids):{data:[]};const ps=must(pR,'MATCH_PLAYERS')||[];const pBy=new Map(ps.map(x=>[x.id,x]));
+    const playerRatings=stats.filter(x=>x.rating!=null).slice(0,8).map(x=>({name:pBy.get(x.player_id)?.name||x.player_id,club:cmap.get(x.club_id)?.name||'-',pos:pBy.get(x.player_id)?.primary_position||'?',rating:Number(x.rating)}));
+    const ev=events.map(e=>({minute:e.match_minute,type:e.event_type==='GOAL'?'goal':e.event_type==='SAVE'?'save':'shot',text:`${e.event_type.replaceAll('_',' ')}${e.xg!=null?` · xG ${Number(e.xg).toFixed(2)}`:''}`}));
+    if(!ev.length)ev.push({minute:live?.match_minute||0,type:'info',text:f.status==='completed'?'Match completed.':'Waiting for server match events.'});
+    const hs=live?.home_score ?? result?.home_score ?? 0, as=live?.away_score ?? result?.away_score ?? 0;
+    return {fixtureId:f.id,home:h.name||'Home',away:a.name||'Away',homeShort:h.short_name||'H',awayShort:a.short_name||'A',kickoff:fmtWib(f.scheduled_kickoff),venue:h.stadium_name||'Home Stadium',status:f.status.toUpperCase(),minute:live?.match_minute || (f.status==='completed'?90:0),homeScore:hs,awayScore:as,possessionHome:Number(live?.home_possession??result?.home_stats?.possession??50),possessionAway:Number(live?.away_possession??result?.away_stats?.possession??50),shotsHome:Number(result?.home_stats?.shots??0),shotsAway:Number(result?.away_stats?.shots??0),sotHome:Number(result?.home_stats?.shots_on_target??0),sotAway:Number(result?.away_stats?.shots_on_target??0),xgHome:Number(live?.home_xg??result?.home_xg??0),xgAway:Number(live?.away_xg??result?.away_xg??0),events:ev,playerRatings,isLive:f.status==='live'};
+  }
+  async function submitLiveTactics(fixtureId,changes){const mapped={...changes};if(mapped.press)mapped.press=pressToServer(mapped.press);return must(await client.rpc('submit_live_tactics',{p_fixture_id:fixtureId,p_changes:mapped}),'LIVE_TACTICS');}
+  async function submitLiveSubstitution(fixtureId,outId,inId){return must(await client.rpc('submit_live_substitution',{p_fixture_id:fixtureId,p_out_player_id:outId,p_in_player_id:inId}),'LIVE_SUB');}
+
+  async function getFinance(){
+    const {club,season}=await context();
+    const [csR,ledR,evR]=await Promise.all([
+      client.from('club_seasons').select('*').eq('club_id',club.id).eq('season_id',season.id).maybeSingle(),
+      client.from('finance_ledger').select('*').eq('club_id',club.id).eq('season_id',season.id).order('created_at',{ascending:false}).limit(25),
+      client.from('finance_events').select('*').eq('club_id',club.id).eq('season_id',season.id).order('created_at',{ascending:false})
+    ]);
+    const cs=must(csR,'FINANCE')||{}, ledger=must(ledR,'LEDGER')||[], ev=must(evR,'FIN_EVENTS')||[];
+    return {balance:cs.balance||0,transferBudget:cs.transfer_budget||0,reserve:cs.reserve_cash||0,wageUsed:cs.weekly_wage_committed||0,wageLimit:cs.wage_limit_weekly||0,sponsorIncome:cs.sponsor_value||0,matchdayIncome:ev.filter(x=>x.event_type==='stadium_home_revenue').reduce((a,b)=>a+num(b.amount),0),seasonPrize:ev.filter(x=>['league_prize','individual_award_bonus'].includes(String(x.event_type))).reduce((a,b)=>a+num(b.amount),0),financialStatus:title(cs.finance_status||'healthy'),transferSpendingFrozen:!!cs.transfer_spending_frozen,ledger:ledger.map(x=>({date:fmtDate(x.created_at),type:String(x.category||'').toUpperCase(),detail:x.detail,amount:x.amount}))};
+  }
+  async function getFacilities(){
+    const {club}=await context(); const f=must(await client.from('club_facilities').select('*').eq('club_id',club.id).maybeSingle(),'FACILITIES')||{};
+    const levels=[0,0,10000000,18000000,28000000,40000000];
+    const mk=(type,key,effects)=>{const lv=f[key]||1;return {type,facilityKey:type.startsWith('Training')?'training':type.startsWith('Medical')?'medical':'stadium',level:lv,effect:effects[lv]||effects[1],nextEffect:lv<5?(effects[lv+1]||'Upgrade'):'MAX LEVEL',upgradeCost:lv<5?levels[lv+1]:0,upgradeTime:'Instant server-side'};};
+    return [mk('Training Centre','training_level',{1:'Development ×1.00',2:'Development ×1.03',3:'Development ×1.06',4:'Development ×1.09',5:'Development ×1.12'}),mk('Medical Centre','medical_level',{1:'Base recovery',2:'Recovery ×1.05',3:'Recovery ×1.10',4:'Recovery ×1.15',5:'Recovery ×1.20'}),mk('Stadium','stadium_level',{1:'£500k / home match',2:'£600k / home match',3:'£725k / home match',4:'£875k / home match',5:'£1M / home match'})];
+  }
+  async function upgradeFacility(key){ const d=must(await client.rpc('upgrade_club_facility',{p_facility:key}),'UPGRADE_FACILITY'); invalidate(); return d; }
+  async function markNotificationRead(id){return must(await client.rpc('mark_notification_read',{p_notification_id:id}),'MARK_READ');}
+  async function markAllNotificationsRead(category=null){return must(await client.rpc('mark_all_notifications_read',{p_category:category}),'MARK_ALL_READ');}
+  async function renewContract(playerId,seasons,wage){const d=must(await client.rpc('renew_contract',{p_player_id:playerId,p_seasons:seasons,p_weekly_wage:wage}),'RENEW_CONTRACT');invalidate();return d;}
+  async function releasePlayer(playerId){const d=must(await client.rpc('release_player',{p_player_id:playerId}),'RELEASE_PLAYER');invalidate();return d;}
+
+  async function getSeasonCentre(){
+    const {season,world}=await context(); const total=Math.max(0,(world.founding_target||4)-1)*2; const phases=['PRESEASON','FIRST_HALF','MIDSEASON_BREAK','SECOND_HALF','OFFSEASON']; const idx=phases.indexOf(season.phase); const labels={PRESEASON:'Preseason',FIRST_HALF:'First Half',MIDSEASON_BREAK:'Midseason',SECOND_HALF:'Second Half',OFFSEASON:'Offseason'};
+    const [awR,hofR]=await Promise.all([client.from('season_awards').select('*').eq('season_id',season.id),client.from('season_hall_of_fame').select('*').order('season_number',{ascending:true})]);
+    const awards=must(awR,'AWARDS')||[], hof=must(hofR,'HOF')||[];
+    const playerIds=awards.map(x=>x.winner_player_id).filter(Boolean); const clubIds=awards.map(x=>x.winner_club_id).filter(Boolean); const [pR,cR]=await Promise.all([playerIds.length?client.from('players').select('id,name').in('id',playerIds):Promise.resolve({data:[]}),clubIds.length?client.from('clubs').select('id,name').in('id',clubIds):Promise.resolve({data:[]})]);const pBy=new Map((must(pR,'AWARD_PLAYERS')||[]).map(x=>[x.id,x]));const cBy=new Map((must(cR,'AWARD_CLUBS')||[]).map(x=>[x.id,x]));
+    const awardsRace=awards.map(a=>({award:title(String(a.award_type).replaceAll('_',' ')),leader:pBy.get(a.winner_player_id)?.name||'-',club:cBy.get(a.winner_club_id)?.name||'-',value:a.metric_value==null?'Awarded':String(a.metric_value)}));
+    const clubsAll=await clubMap(world.id); const hofPlayerIds=[...new Set(hof.flatMap(h=>[h.golden_boot_player_id,h.top_assist_player_id,h.golden_glove_player_id,h.player_of_season_player_id]).filter(Boolean))];const hpR=hofPlayerIds.length?await client.from('players').select('id,name').in('id',hofPlayerIds):{data:[]};const hpBy=new Map((must(hpR,'HOF_PLAYERS')||[]).map(x=>[x.id,x]));
+    const hallOfFame=hof.map(h=>({season:`Season ${h.season_number}`,champion:clubsAll.get(h.champion_club_id)?.name||'-',runnerUp:clubsAll.get(h.runner_up_club_id)?.name||'-',finalTable:Array.isArray(h.final_table)?`${h.final_table.length} clubs`:'Archived',goldenBoot:hpBy.get(h.golden_boot_player_id)?.name||'-',topAssist:hpBy.get(h.top_assist_player_id)?.name||'-',goldenGlove:hpBy.get(h.golden_glove_player_id)?.name||'-',playerSeason:hpBy.get(h.player_of_season_player_id)?.name||'-',biggestWin:h.biggest_win_fixture_id?'Archived':'-',highestScoring:h.highest_scoring_fixture_id?'Archived':'-'}));
+    const timeline=phases.map((p,i)=>({key:p,label:labels[p],status:i<idx?'done':i===idx?'current':'future',note:p==='MIDSEASON_BREAK'?'2 days · transfer window':p==='OFFSEASON'?'2 days · rollover':p==='FIRST_HALF'?'First half fixtures':p==='SECOND_HALF'?'Second half fixtures':'Preparation'}));
+    return {currentSeason:season.season_number,phase:season.phase,phaseLabel:labels[season.phase]||title(season.phase),progressPct:total?Math.min(100,Math.round((season.matchday/total)*100)):0,currentMatchday:season.matchday,totalMatchdays:total,daysUntilMidseason:0,timeline,awardsRace,hallOfFame,rollover:['Finalize standings and champion','Pay league prizes and awards','Apply player development','Age all active players +1','Apply age decline','Process retirement','Reduce/renew contracts','Expired contracts become free agents','Issue sponsor / new-season budget','Open 2-day offseason','Create next season']};
+  }
+
+  async function getClubHistory(){
+    const {club,profile,season}=await context(); const trophies=must(await client.from('club_trophies').select('*').eq('club_id',club.id),'TROPHIES')||[]; const history=must(await client.from('transfer_history').select('*').eq('to_club_id',club.id).order('transfer_fee',{ascending:false}).limit(1),'TRANSFER_HISTORY')||[];
+    return {founded:'Season 1',manager:profile.display_name||profile.username,homeGround:club.stadium_name,highestPosition:'In progress',biggestWin:'In progress',recordSigning:history[0]?`£${Math.round(history[0].transfer_fee/1000000)}M`:'No permanent signing yet',trophies:[{name:'League Championship',count:trophies.filter(x=>x.trophy_type==='LEAGUE_CHAMPION').length},{name:'Golden Boot',count:0},{name:'Player of the Season',count:0},{name:'Manager of the Season',count:0}],events:[{season:`Season ${season.season_number}`,event:'Closed Alpha club active in server world.'}]};
+  }
+  async function getFoundingDraw(){ const {world}=await context(); const clubs=[...await clubMap(world.id).then(m=>m.values())]; const squad=await getSquad(); const tiers={S:0,A:0,B:0,C:0,D:0}; squad.forEach(p=>tiers[p.tier]=(tiers[p.tier]||0)+1); return {status:world.founding_draw_status,foundingManagers:clubs.length,maxManagers:world.max_managers,seed:'Server-controlled',simultaneous:true,rerollAllowed:false,fairnessTarget:'Server controlled',idealTierMix:'1 S + 3 A + 7 B + 8 C + 3 D',squadComposition:[['GK',2],['RB',2],['CB',4],['LB',2],['DM/CM',4],['AM',2],['RW',2],['LW',2],['ST',2]],clubs:[{club:(await context()).club.name,avgOvr:squad.length?(squad.reduce((a,p)=>a+p.ovr,0)/squad.length).toFixed(1):0,sTier:tiers.S,aTier:tiers.A,bTier:tiers.B,cTier:tiers.C,dTier:tiers.D}]}; }
+  async function getContractActions(){return {renewalLengths:[1,2,3],releaseCompensationPct:[30,40,50]};}
+  async function getAdminState(){return window.MockDB.admin;}
+
+  return {mode:'supabase-alpha',invalidate,context,getManager,getSeason,getClub,getNextFixture,getRecentActivities,getSquad,getPlayerById,getTrainingState,getTrainingHistory,getTransferMarket,getLeague,getMatchCentre,getFinance,getFacilities,getNotifications,getSeasonCentre,getClubHistory,getAdminState,getFoundingDraw,getLineupRules,getContractActions,getSavedSetup,hydrateUIState,saveTactics,saveLineup,scheduleTraining,setIndividualFocus,listPlayerForTransfer,makeTransferOffer,respondTransferOffer,placeFreeAgentBid,upgradeFacility,markNotificationRead,markAllNotificationsRead,renewContract,releasePlayer,submitLiveTactics,submitLiveSubstitution};
+})();
+</script>
+
 <script>
 window.MockDB = {
   manager: {
@@ -2551,6 +2882,7 @@ window.GameService = (() => {
     getContractActions
   };
 })();
+window.MockGameService = window.GameService;
 
 </script>
 <script>
@@ -2653,7 +2985,7 @@ window.GameService = (() => {
   const formations = {
     "4-3-3": [
       ["GK",50,90],["RB",82,73],["CB",62,74],["CB",38,74],["LB",18,73],
-      ["CM",66,53],["DM",50,59],["CM",34,53],
+      ["CM",66,53],["CM",50,59],["CM",34,53],
       ["RW",77,28],["ST",50,18],["LW",23,28]
     ],
     "4-2-3-1": [
@@ -2662,35 +2994,35 @@ window.GameService = (() => {
     ],
     "4-4-2": [
       ["GK",50,90],["RB",82,73],["CB",62,74],["CB",38,74],["LB",18,73],
-      ["RM",80,50],["CM",61,53],["CM",39,53],["LM",20,50],
+      ["RW",80,50],["CM",61,53],["CM",39,53],["LW",20,50],
       ["ST",62,22],["ST",38,22]
     ],
     "4-1-4-1": [
       ["GK",50,90],["RB",82,73],["CB",62,74],["CB",38,74],["LB",18,73],
-      ["DM",50,62],["RM",79,45],["CM",61,48],["CM",39,48],["LM",21,45],["ST",50,18]
+      ["DM",50,62],["RW",79,45],["CM",61,48],["CM",39,48],["LW",21,45],["ST",50,18]
     ],
     "4-3-2-1": [
       ["GK",50,90],["RB",82,73],["CB",62,74],["CB",38,74],["LB",18,73],
-      ["CM",68,55],["DM",50,61],["CM",32,55],
+      ["CM",68,55],["CM",50,61],["CM",32,55],
       ["AM",63,34],["AM",37,34],["ST",50,17]
     ],
     "3-5-2": [
       ["GK",50,90],["CB",70,73],["CB",50,76],["CB",30,73],
-      ["RWB",84,51],["CM",64,52],["DM",50,59],["CM",36,52],["LWB",16,51],
+      ["RW",84,51],["CM",64,52],["CM",50,59],["CM",36,52],["LW",16,51],
       ["ST",62,22],["ST",38,22]
     ],
     "3-4-3": [
       ["GK",50,90],["CB",70,73],["CB",50,76],["CB",30,73],
-      ["RM",82,52],["CM",61,54],["CM",39,54],["LM",18,52],
-      ["RW",76,28],["ST",50,18],["LW",24,28]
+      ["RW",82,52],["CM",61,54],["CM",39,54],["LW",18,52],
+      ["ST",76,28],["ST",50,18],["ST",24,28]
     ],
     "5-3-2": [
-      ["GK",50,90],["RWB",86,63],["CB",70,73],["CB",50,77],["CB",30,73],["LWB",14,63],
-      ["CM",66,49],["DM",50,55],["CM",34,49],["ST",62,22],["ST",38,22]
+      ["GK",50,90],["RB",86,63],["CB",70,73],["CB",50,77],["CB",30,73],["LB",14,63],
+      ["CM",66,49],["CM",50,55],["CM",34,49],["ST",62,22],["ST",38,22]
     ],
     "5-4-1": [
-      ["GK",50,90],["RWB",86,65],["CB",70,74],["CB",50,78],["CB",30,74],["LWB",14,65],
-      ["RM",80,48],["CM",61,53],["CM",39,53],["LM",20,48],["ST",50,19]
+      ["GK",50,90],["RB",86,65],["CB",70,74],["CB",50,78],["CB",30,74],["LB",14,65],
+      ["RW",80,48],["CM",61,53],["CM",39,53],["LW",20,48],["ST",50,19]
     ]
   };
 
@@ -2871,9 +3203,9 @@ window.GameService = (() => {
           <div class="alpha-stat"><span>Owned Players</span><strong>${squad.count}</strong></div>
           <div class="alpha-stat"><span>Draw Status</span><strong>${htmlSafe(world.founding_draw_status)}</strong></div>
         </div>
-        <div class="alpha-status-box"><strong>Onboarding Gate selesai untuk akun ini</strong><p>Real Gameplay Bridge V1 sudah tersedia. Semua 22 pemain tetap ada di server; daftar singkat di bawah hanya preview.</p></div>
-        <div class="alpha-user-list">${(squad.players || []).slice(0,6).map(x=>`<div class="alpha-user-row"><div><strong>${htmlSafe(x.name || x.player_id)}</strong><span>${htmlSafe(x.primary_position || "")} · OVR ${htmlSafe(x.current_ovr)} · Tier ${htmlSafe(x.current_tier)} · ${htmlSafe(x.reference_club || "")} ${htmlSafe(x.reference_season || "")}</span></div></div>`).join("")}</div>
-        <button class="primary-btn" id="enterRealGameplayBtn" type="button">ENTER REAL GAMEPLAY</button>
+        <div class="alpha-status-box"><strong>Phase 20B Real Gameplay Bridge aktif</strong><p>Squad, tactics, training, transfer, finance, league, match centre, contracts dan inbox sekarang membaca/menulis Supabase Alpha. Server tetap source of truth.</p></div>
+        <div class="alpha-user-list">${(squad.players || []).map(x=>`<div class="alpha-user-row"><div><strong>${htmlSafe(x.name || x.player_id)}</strong><span>${htmlSafe(x.primary_position || "")} · OVR ${htmlSafe(x.current_ovr)} · Tier ${htmlSafe(x.current_tier)} · ${htmlSafe(x.reference_club || "")} ${htmlSafe(x.reference_season || "")}</span></div></div>`).join("")}</div>
+        <button class="primary-btn" id="enterRealGameplayBtn" type="button">Enter Real Alpha Gameplay</button>
         <button class="secondary-btn" id="refreshReadyBtn" style="width:100%;margin-top:8px" type="button">Refresh Squad</button>
         <button class="secondary-btn" id="readyLogoutBtn" style="width:100%;margin-top:8px" type="button">Logout</button>
       </div></div>`;
@@ -2942,6 +3274,7 @@ window.GameService = (() => {
     state.alpha.bootstrap = null;
     state.session.screen = "login";
     state.session.loggedIn = false;
+    if(window.MockGameService) window.GameService=window.MockGameService;
     await showAuth();
   }
 
@@ -2967,6 +3300,27 @@ window.GameService = (() => {
       return null;
     } finally {
       state.alpha.loading = false;
+    }
+  }
+
+  async function enterRealGameplay() {
+    try {
+      window.GameService = window.RealGameService;
+      await window.RealGameService.hydrateUIState(state);
+      state.session.loggedIn = true;
+      state.session.approved = true;
+      state.session.clubCreated = true;
+      authRoot.innerHTML = "";
+      gameApp.classList.remove("is-hidden");
+      const legacyAdminNav = nav.querySelector('[data-view="admin"]');
+      if (legacyAdminNav) legacyAdminNav.classList.add('is-hidden');
+      state.view = "home";
+      syncActiveNav();
+      await render();
+      await refreshNotificationCounts();
+    } catch (err) {
+      console.error('Real gameplay entry failed',err);
+      showToast(`Gameplay gagal: ${err.message}`);
     }
   }
 
@@ -3030,10 +3384,7 @@ window.GameService = (() => {
       document.getElementById("refreshDrawBtn")?.addEventListener("click", () => showAuth(true));
       document.getElementById("waitingLogoutBtn")?.addEventListener("click", alphaLogout);
     } else if (mode === "alphaReady") {
-      document.getElementById("enterRealGameplayBtn")?.addEventListener("click", async () => {
-        try { await window.RealAlphaGame.mount(); }
-        catch (err) { console.error(err); showToast(`Gameplay gagal dibuka: ${err.message || err}`); }
-      });
+      document.getElementById("enterRealGameplayBtn")?.addEventListener("click", enterRealGameplay);
       document.getElementById("refreshReadyBtn")?.addEventListener("click", () => showAuth(true));
       document.getElementById("readyLogoutBtn")?.addEventListener("click", alphaLogout);
     } else if (mode === "adminLobby") {
@@ -3231,7 +3582,7 @@ window.GameService = (() => {
               <div>
                 <p class="eyebrow">TEAM PROFILE</p>
                 <h2>Current Strength</h2>
-                <p>Mock squad ratings — engine belum aktif.</p>
+                <p>Server squad ratings · Supabase Alpha source of truth.</p>
               </div>
             </div>
             <div class="form-bars">
@@ -3322,7 +3673,7 @@ window.GameService = (() => {
 
   async function renderDraw() {
     setHeader("Founding Squad Draw", "SEASON 1 INITIALIZATION");
-    const [draw,squad]=await Promise.all([GameService.getFoundingDraw(),GameService.getSquad()]);
+    const [draw,squad,realClub]=await Promise.all([GameService.getFoundingDraw(),GameService.getSquad(),GameService.getClub()]);
     const tierCounts=squad.reduce((a,p)=>(a[p.tier]=(a[p.tier]||0)+1,a),{});
     const avgOvr=(squad.reduce((a,p)=>a+p.ovr,0)/squad.length).toFixed(1);
     root.innerHTML=`
@@ -3347,8 +3698,8 @@ window.GameService = (() => {
           </article>
         </div>
         <aside class="stack">
-          <article class="card section-card"><div class="section-head"><div><p class="eyebrow">YOUR RESULT</p><h2>${window.MockDB.club.name}</h2></div></div><div class="activity-list">${["S","A","B","C","D"].map(t=>`<div class="activity"><div class="activity-icon">${t}</div><div><strong>Tier ${t}</strong><p>${tierCounts[t]||0} player(s)</p></div></div>`).join("")}</div></article>
-          <article class="card section-card"><p class="eyebrow">DRAW SEED / LOG</p><h2 style="font-size:15px">${draw.seed}</h2><p style="font-size:10px;color:var(--muted)">Mock display only. Real seed and allocation log must stay server-side.</p><button class="primary-btn" id="finishDrawBtn" type="button">Continue to Squad</button></article>
+          <article class="card section-card"><div class="section-head"><div><p class="eyebrow">YOUR RESULT</p><h2>${realClub.name}</h2></div></div><div class="activity-list">${["S","A","B","C","D"].map(t=>`<div class="activity"><div class="activity-icon">${t}</div><div><strong>Tier ${t}</strong><p>${tierCounts[t]||0} player(s)</p></div></div>`).join("")}</div></article>
+          <article class="card section-card"><p class="eyebrow">DRAW SEED / LOG</p><h2 style="font-size:15px">${draw.seed}</h2><p style="font-size:10px;color:var(--muted)">Draw seed/allocation details remain server-side for fairness auditing.</p><button class="primary-btn" id="finishDrawBtn" type="button">Continue to Squad</button></article>
         </aside>
       </div>`;
     document.getElementById("finishDrawBtn")?.addEventListener("click",()=>{state.view="squad";syncActiveNav();render();});
@@ -3384,6 +3735,7 @@ window.GameService = (() => {
                 <th>Pos</th>
                 <th>OVR</th>
                 <th>Age</th>
+                <th>Historical Reference</th>
                 <th>Fitness</th>
                 <th>Form</th>
                 <th>Injury</th>
@@ -3432,6 +3784,7 @@ window.GameService = (() => {
           <td><span class="pos">${p.pos}</span></td>
           <td><span class="ovr">${p.ovr}</span></td>
           <td>${p.age}</td>
+          <td><strong>${p.refClub||"-"}</strong><span class="subtext">${p.refSeason||"-"} · Ref age ${p.refAge??"-"} · ${p.careerStage||""}</span></td>
           <td>
             <div class="fitness">
               <div class="fitness-bar"><i style="width:${p.fitness}%"></i></div>
@@ -3446,7 +3799,7 @@ window.GameService = (() => {
           <td>${wage(p.wage)}</td>
         </tr>
       `).join("") : `
-        <tr><td colspan="11" style="text-align:center;color:var(--muted);padding:36px">No players found.</td></tr>
+        <tr><td colspan="12" style="text-align:center;color:var(--muted);padding:36px">No players found.</td></tr>
       `;
 
       body.querySelectorAll("[data-player]").forEach(btn => {
@@ -3658,7 +4011,7 @@ window.GameService = (() => {
               <div>
                 <p class="eyebrow">TACTICAL PROFILE</p>
                 <h2>Estimated Style</h2>
-                <p>Preview only — match engine belum terhubung.</p>
+                <p>Style preview; saved tactics are server-authoritative.</p>
               </div>
             </div>
             <div class="tactical-profile">
@@ -3693,14 +4046,23 @@ window.GameService = (() => {
     document.getElementById("autoPickBtn").addEventListener("click", () => {
       assignDefaultLineup(players, state.tactics.formation);
       state.selectedSlot = null;
-      showToast("Best-fit XI selected from mock squad.");
+      showToast("Best-fit XI selected from real Alpha squad.");
       renderTactics();
     });
 
-    document.getElementById("saveTacticsBtn").addEventListener("click", () => {
+    document.getElementById("saveTacticsBtn").addEventListener("click", async () => {
       state.selectedSlot = null;
-      showToast("Tactics saved locally (mock mode).");
-      renderTactics();
+      const btn=document.getElementById("saveTacticsBtn"); btn.disabled=true;
+      try {
+        await GameService.saveTactics({...state.tactics,autoSubEnabled:state.tactics.autoSubEnabled!==false});
+        const shape=formations[state.tactics.formation];
+        const starters=shape.map((slot,idx)=>({player_id:state.lineup[idx],position:slot[0]}));
+        if(starters.some(x=>!x.player_id)) throw new Error('Starting XI belum lengkap.');
+        const bench=state.bench.filter(Boolean).slice(0,9).map(id=>({player_id:id}));
+        await GameService.saveLineup(state.tactics.formation,starters,bench);
+        showToast("Tactics + lineup saved to Supabase Alpha.");
+      } catch(err){ showToast(`Save gagal: ${err.message}`); }
+      finally { btn.disabled=false; await renderTactics(); }
     });
 
     root.querySelectorAll("[data-tactic]").forEach(select => {
@@ -3722,7 +4084,7 @@ window.GameService = (() => {
       btn.addEventListener("click", () => openPlayer(btn.dataset.benchPlayer));
     });
 
-    document.getElementById("autoSubToggle")?.addEventListener("click",()=>{window.MockDB.lineupRules.autoSubEnabled=!window.MockDB.lineupRules.autoSubEnabled;renderTactics();});
+    document.getElementById("autoSubToggle")?.addEventListener("click",()=>{state.tactics.autoSubEnabled=!(state.tactics.autoSubEnabled!==false);showToast("Auto-sub preference changed. Click Save Tactics to persist.");renderTactics();});
 
     root.querySelectorAll("[data-pick-player]").forEach(btn => {
       btn.addEventListener("click", () => {
@@ -3881,7 +4243,7 @@ window.GameService = (() => {
       ? `<div class="training-warning">Intensive training memberi DXP tertinggi, tetapi squad fitness turun lebih besar. Menjelang dua matchday dalam satu hari, ini berisiko jika pemain tidak cukup bugar.</div>`
       : state.training.type === "Recovery"
       ? `<div class="training-safe">Recovery hampir tidak meningkatkan atribut, tetapi sangat berguna untuk memulihkan squad setelah dua pertandingan dalam satu hari.</div>`
-      : `<div class="training-safe">Beban latihan masih dalam range aman untuk mock squad saat ini.</div>`;
+      : `<div class="training-safe">Training-load preview based on current real squad fitness.</div>`;
 
     root.innerHTML = `
       <div class="training-layout">
@@ -3953,7 +4315,7 @@ window.GameService = (() => {
             ${warning}
 
             <button type="button" class="primary-btn" id="startTrainingBtn" ${state.training.completed ? "disabled":""}>
-              ${state.training.completed ? "Today's Training Completed" : "Run Training Session"}
+              ${state.training.completed ? "Today's Training Completed" : (trainingState.scheduled ? "Update Today's Training" : "Schedule Today's Training")}
             </button>
           </article>
 
@@ -4117,9 +4479,10 @@ window.GameService = (() => {
     });
 
     root.querySelectorAll("[data-individual-focus]").forEach(sel => {
-      sel.addEventListener("change", () => {
+      sel.addEventListener("change", async () => {
         state.training.individualFocus[sel.dataset.individualFocus] = sel.value;
-        showToast(`Individual focus set to ${sel.value}.`);
+        try { await GameService.setIndividualFocus(sel.dataset.individualFocus,sel.value); showToast(`Individual focus saved: ${sel.value}.`); }
+        catch(err){ showToast(`Focus gagal: ${err.message}`); }
       });
     });
 
@@ -4129,11 +4492,12 @@ window.GameService = (() => {
 
     const startBtn = document.getElementById("startTrainingBtn");
     if (startBtn) {
-      startBtn.addEventListener("click", () => {
+      startBtn.addEventListener("click", async () => {
         if (state.training.completed) return;
-        state.training.completed = true;
-        showToast(`${state.training.type} training completed locally.`);
-        renderTraining();
+        startBtn.disabled=true;
+        try { await GameService.scheduleTraining(state.training.type); showToast(`${state.training.type} training scheduled on server.`); }
+        catch(err){ showToast(`Training gagal: ${err.message}`); }
+        await renderTraining();
       });
     }
   }
@@ -4324,7 +4688,7 @@ window.GameService = (() => {
     });
 
     container.querySelectorAll("[data-market-watch]").forEach(btn => {
-      btn.addEventListener("click", () => showToast("Added to watchlist (mock)."));
+      btn.addEventListener("click", () => showToast("Watchlist UI is local-only in this Alpha build."));
     });
 
     container.querySelectorAll("[data-market-offer]").forEach(btn => {
@@ -4332,7 +4696,6 @@ window.GameService = (() => {
         const player = market.transferList.find(p=>p.id===btn.dataset.marketOffer);
         state.transfers.selectedPlayer = player.id;
         state.transfers.offerAmount = player.price;
-        state.transfers.contractYears = 2;
         renderTransfers();
       });
     });
@@ -4344,7 +4707,7 @@ window.GameService = (() => {
     if (!player) return "";
     const amount = state.transfers.offerAmount || player.price;
     const afterBudget = club.transferBudget - amount;
-    const contractYears = state.transfers.contractYears || 2;
+    const contractYears = player.contract || 1;
     const financeOk = amount <= club.transferBudget;
     const wageOk = player.wage <= wageRoom;
     const squadOk = availableSlots > 0;
@@ -4379,12 +4742,7 @@ window.GameService = (() => {
               <label for="offerAmount">Transfer Fee</label>
               <input id="offerAmount" class="money-input" type="number" min="0" step="500000" value="${amount}" />
             </div>
-            <div>
-              <label for="offerContract">Contract Length</label>
-              <select id="offerContract" class="game-select" style="width:100%">
-                ${[1,2,3].map(y=>`<option value="${y}" ${contractYears===y?"selected":""}>${y} season${y>1?"s":""}</option>`).join("")}
-              </select>
-            </div>
+            <div class="alpha-status-box"><strong>Contract term</strong><p>${contractYears} season${contractYears>1?"s":""} remaining. Direct transfer settlement preserves the current remaining term; wage is validated server-side.</p></div>
             <button class="primary-btn" id="submitOfferBtn" type="button" ${allOk ? "" : "disabled"}>Submit Offer</button>
           </div>
         </article>
@@ -4409,7 +4767,7 @@ window.GameService = (() => {
 
           <div style="height:12px"></div>
           ${allOk
-            ? `<div class="finance-ok">Offer passes current mock checks: transfer budget, wage room and squad limit. Real settlement will be atomic server-side; accepted purchase receives a 2-matchday resale cooldown.</div>`
+            ? `<div class="finance-ok">Offer passes client preview checks: transfer budget, wage room and squad limit. Real settlement will be atomic server-side; accepted purchase receives a 2-matchday resale cooldown.</div>`
             : `<div class="finance-warning">${!financeOk?"Transfer budget insufficient. ":""}${!wageOk?"Wage room insufficient. ":""}${!squadOk?"Squad already at maximum size.":""}</div>`}
         </article>
       </div>
@@ -4418,7 +4776,6 @@ window.GameService = (() => {
 
   function wireOfferPanel(container, market, club, availableSlots, wageRoom) {
     const amountInput = document.getElementById("offerAmount");
-    const contractSelect = document.getElementById("offerContract");
     const submit = document.getElementById("submitOfferBtn");
 
     if (amountInput) {
@@ -4427,18 +4784,13 @@ window.GameService = (() => {
         renderTransfers();
       });
     }
-    if (contractSelect) {
-      contractSelect.addEventListener("change", () => {
-        state.transfers.contractYears = Number(contractSelect.value);
-        renderTransfers();
-      });
-    }
     if (submit) {
-      submit.addEventListener("click", () => {
+      submit.addEventListener("click", async () => {
         const p = market.transferList.find(x=>x.id===state.transfers.selectedPlayer);
-        showToast(`Offer ${money(state.transfers.offerAmount)} submitted for ${p.name} (mock).`);
-        state.transfers.selectedPlayer = null;
-        renderTransfers();
+        submit.disabled=true;
+        try { await GameService.makeTransferOffer(p.id,state.transfers.offerAmount,p.wage); showToast(`Offer ${money(state.transfers.offerAmount)} submitted for ${p.name}.`); state.transfers.selectedPlayer=null; }
+        catch(err){ showToast(`Offer gagal: ${err.message}`); }
+        await renderTransfers();
       });
     }
   }
@@ -4455,7 +4807,7 @@ window.GameService = (() => {
           <span class="badge live">${market.freeAgents.length} active</span>
         </div>
         <div class="lock-banner">Auction duration ≈6–12 hours. Highest bid wins as signing bonus. Any new bid in the final 5 minutes extends the auction by +5 minutes.</div>
-        <button class="secondary-btn" id="nominateFreeAgentBtn" type="button" style="margin-bottom:12px">Nominate Free Agent (Mock)</button>
+        <button class="secondary-btn" id="nominateFreeAgentBtn" type="button" style="margin-bottom:12px" disabled>Free-agent auctions are opened by server/admin workflow</button>
         <div class="transfer-grid">
           ${market.freeAgents.map(p => {
             const minBid = p.currentBid > 0 ? p.currentBid + 500000 : p.openingBid;
@@ -4493,12 +4845,19 @@ window.GameService = (() => {
       </article>
     `;
 
-    document.getElementById("nominateFreeAgentBtn")?.addEventListener("click",()=>showToast("Free-agent nomination flow opened (mock)."));
+    document.getElementById("nominateFreeAgentBtn")?.addEventListener("click",()=>showToast("Admin starts free-agent auctions; manager bidding is real."));
     container.querySelectorAll("[data-auction-bid]").forEach(btn => {
-      btn.addEventListener("click", () => {
+      btn.addEventListener("click", async () => {
         const p = market.freeAgents.find(x=>x.id===btn.dataset.auctionBid);
-        const nextBid = p.currentBid + 500000;
-        showToast(`Bid ${money(nextBid)} placed for ${p.name} (mock).`);
+        const nextBid = p.currentBid>0 ? p.currentBid+500000 : p.openingBid;
+        const tierMid={S:100000,A:67500,B:45000,C:27500,D:15000};
+        const proposedWage=Math.max(0,Number(prompt(`Weekly wage for ${p.name} (£/week)`,String(p.wage||tierMid[p.tier]||20000))));
+        if(!proposedWage)return;
+        const years=Math.min(3,Math.max(1,Number(prompt('Contract seasons (1-3)','2'))||2));
+        btn.disabled=true;
+        try { await GameService.placeFreeAgentBid(p.id,nextBid,proposedWage,years); showToast(`Bid ${money(nextBid)} · ${wage(proposedWage)} · ${years} season placed for ${p.name}.`); }
+        catch(err){ showToast(`Bid gagal: ${err.message}`); }
+        await renderTransfers();
       });
     });
   }
@@ -4557,11 +4916,7 @@ window.GameService = (() => {
             </thead>
             <tbody>
               ${market.offersReceived.map(o => {
-                const owned=window.MockDB.players;
-                const offered=owned.find(p=>p.id===o.playerId);
-                const gkCount=owned.filter(p=>p.pos==="GK").length;
-                const keepsMinGk=!(offered?.pos==="GK" && gkCount<=2);
-                const canSell = squadSize - 1 >= market.squadMin && keepsMinGk && !(offered?.resaleCooldown>0);
+                const canSell = squadSize - 1 >= market.squadMin;
                 return `
                   <tr>
                     <td><strong>${o.player}</strong></td>
@@ -4586,13 +4941,13 @@ window.GameService = (() => {
     `;
 
     container.querySelectorAll("[data-offer-accept]").forEach(btn => {
-      btn.addEventListener("click", () => showToast("Offer accepted locally (mock)."));
+      btn.addEventListener("click", async () => {btn.disabled=true;try{await GameService.respondTransferOffer(btn.dataset.offerAccept,"accept");showToast("Offer accepted and settled server-side.");}catch(err){showToast(`Accept gagal: ${err.message}`);}await renderTransfers();});
     });
     container.querySelectorAll("[data-offer-counter]").forEach(btn => {
-      btn.addEventListener("click", () => showToast("Counter-offer flow placeholder ready."));
+      btn.addEventListener("click", async () => {const amount=Number(prompt("Counter amount (£)","20000000"));if(!amount)return;try{await GameService.respondTransferOffer(btn.dataset.offerCounter,"counter",amount);showToast("Counter-offer sent.");}catch(err){showToast(`Counter gagal: ${err.message}`);}await renderTransfers();});
     });
     container.querySelectorAll("[data-offer-reject]").forEach(btn => {
-      btn.addEventListener("click", () => showToast("Offer rejected locally (mock)."));
+      btn.addEventListener("click", async () => {try{await GameService.respondTransferOffer(btn.dataset.offerReject,"reject");showToast("Offer rejected server-side.");}catch(err){showToast(`Reject gagal: ${err.message}`);}await renderTransfers();});
     });
   }
 
@@ -4618,11 +4973,11 @@ window.GameService = (() => {
           <div class="section-card" style="padding-bottom:8px">
             <div class="section-head">
               <div>
-                <p class="eyebrow">SEASON 1</p>
+                <p class="eyebrow">SEASON ${league.seasonNumber}</p>
                 <h2>${league.name}</h2>
                 <p>Double round-robin · 3 points win / 1 draw / 0 loss.</p>
               </div>
-              <span class="badge live">Matchday 5</span>
+              <span class="badge live">Matchday ${league.matchday} · ${league.phase}</span>
             </div>
           </div>
           <div class="table-wrap">
@@ -4632,7 +4987,7 @@ window.GameService = (() => {
               </thead>
               <tbody>
                 ${league.standings.map(r => `
-                  <tr class="${r.club==="MS7 FC"?"highlight":""}">
+                  <tr class="${r.club===league.myClubName?"highlight":""}">
                     <td><div class="position-badge">${r.pos}</div></td>
                     <td>${r.club}</td><td>${r.p}</td><td>${r.w}</td><td>${r.d}</td><td>${r.l}</td>
                     <td>${r.gf}</td><td>${r.ga}</td><td>${r.gd>0?"+":""}${r.gd}</td><td><strong>${r.pts}</strong></td>
@@ -4651,7 +5006,7 @@ window.GameService = (() => {
             <div>
               <p class="eyebrow">FIXTURES</p>
               <h2>Match Schedule</h2>
-              <p>Current mock schedule. Exact kickoff remains configurable later.</p>
+              <p>Server fixture schedule from Supabase Alpha.</p>
             </div>
           </div>
           <div class="fixture-list">
@@ -4675,14 +5030,14 @@ window.GameService = (() => {
         <div class="stats-podium">${top.map((p,i)=>`<article class="podium-card"><span>#${i+1} · ${p.club}</span><strong>${p.name}</strong><b>${p.goals} G</b><span>${p.assists} assists · Rating ${p.rating}</span></article>`).join("")}</div>
         <article class="card table-card"><div class="table-wrap"><table class="transfer-table"><thead><tr><th>#</th><th>Player</th><th>Club</th><th>Pos</th><th>Goals</th><th>Assists</th><th>Rating</th></tr></thead><tbody>${league.playerStats.map(p=>`<tr><td>${p.rank}</td><td><strong>${p.name}</strong></td><td>${p.club}</td><td>${p.pos}</td><td>${p.goals}</td><td>${p.assists}</td><td>${p.rating}</td></tr>`).join("")}</tbody></table></div></article>`;
     } else if (state.league.tab === "awards") {
-      const sc=window.MockDB.seasonCentre;
-      content.innerHTML=`<article class="card section-card"><div class="section-head"><div><p class="eyebrow">AWARDS RACE</p><h2>Season ${sc.currentSeason}</h2><p>Award bonus is intentionally small relative to club finances.</p></div></div><div class="award-grid">${sc.awardsRace.map(a=>`<div class="award-card"><span>${a.award}</span><strong>${a.leader}</strong><span>${a.club}</span><b>${a.value}</b><span>Bonus ${money(window.MockDB.finance.awardBonus[a.award]||0)}</span></div>`).join("")}</div></article>`;
+      const sc=await GameService.getSeasonCentre();
+      content.innerHTML=`<article class="card section-card"><div class="section-head"><div><p class="eyebrow">AWARDS RACE</p><h2>Season ${sc.currentSeason}</h2><p>Award bonus is intentionally small relative to club finances.</p></div></div><div class="award-grid">${sc.awardsRace.map(a=>`<div class="award-card"><span>${a.award}</span><strong>${a.leader}</strong><span>${a.club}</span><b>${a.value}</b><span>Bonus ${money(({"Golden Boot":2000000,"Top Assist":1500000,"Golden Glove":1500000,"Player Of Season":2000000,"Player of Season":2000000}[a.award]||0))}</span></div>`).join("")}</div></article>`;
     } else if (state.league.tab === "hall") {
-      const sc=window.MockDB.seasonCentre;
+      const sc=await GameService.getSeasonCentre();
       content.innerHTML=`<article class="card table-card"><div class="section-card" style="padding-bottom:8px"><div class="section-head"><div><p class="eyebrow">HALL OF FAME</p><h2>Permanent World History</h2><p>Never reset between seasons.</p></div></div></div><div class="table-wrap"><table class="hof-table"><thead><tr><th>Season</th><th>Champion</th><th>Runner-up</th><th>Final Table</th><th>Golden Boot</th><th>Top Assist</th><th>Golden Glove</th><th>Player of Season</th><th>Biggest Win</th><th>Highest Scoring</th></tr></thead><tbody>${sc.hallOfFame.map(h=>`<tr><td>${h.season}</td><td>${h.champion}</td><td>${h.runnerUp}</td><td>${h.finalTable}</td><td>${h.goldenBoot}</td><td>${h.topAssist}</td><td>${h.goldenGlove}</td><td>${h.playerSeason}</td><td>${h.biggestWin}</td><td>${h.highestScoring}</td></tr>`).join("")}</tbody></table></div></article>`;
     } else {
-      const sc=window.MockDB.seasonCentre;
-      content.innerHTML=`<div class="season-hero"><article class="card section-card"><div class="section-head"><div><p class="eyebrow">SEASON ${sc.currentSeason}</p><h2>${sc.phaseLabel}</h2><p>2 matchdays/day · ${sc.totalMatchdays} matchdays at 12 clubs · target cycle ≈15 days.</p></div><span class="badge live">${sc.progressPct}%</span></div><div class="match-progress"><i style="width:${sc.progressPct}%"></i></div><div style="height:16px"></div><div class="phase-track">${sc.timeline.map(p=>`<div class="phase-item ${p.status}"><strong>${p.label}</strong><span>${p.note}</span><span class="phase-state">${p.status}</span></div>`).join("")}</div></article><aside class="card section-card"><p class="eyebrow">ROLLOVER ORDER</p><div class="rollover-list">${sc.rollover.map((r,i)=>`<div class="rollover-row"><i>${i+1}</i><strong>${r}</strong></div>`).join("")}</div></aside></div>`;
+      const sc=await GameService.getSeasonCentre();
+      content.innerHTML=`<div class="season-hero"><article class="card section-card"><div class="section-head"><div><p class="eyebrow">SEASON ${sc.currentSeason}</p><h2>${sc.phaseLabel}</h2><p>2 matchdays/day · ${sc.totalMatchdays} matchdays · Closed Alpha ${league.clubCount} clubs.</p></div><span class="badge live">${sc.progressPct}%</span></div><div class="match-progress"><i style="width:${sc.progressPct}%"></i></div><div style="height:16px"></div><div class="phase-track">${sc.timeline.map(p=>`<div class="phase-item ${p.status}"><strong>${p.label}</strong><span>${p.note}</span><span class="phase-state">${p.status}</span></div>`).join("")}</div></article><aside class="card section-card"><p class="eyebrow">ROLLOVER ORDER</p><div class="rollover-list">${sc.rollover.map((r,i)=>`<div class="rollover-row"><i>${i+1}</i><strong>${r}</strong></div>`).join("")}</div></aside></div>`;
     }
 
     root.querySelectorAll("[data-league-tab]").forEach(btn=>{
@@ -4737,131 +5092,28 @@ window.GameService = (() => {
   }
 
   async function renderMatch() {
-    setHeader("Match Centre", "LIVE MATCH PREVIEW");
+    setHeader("Match Centre", "SERVER MATCH STATE");
     const base = await GameService.getMatchCentre();
-    if (!state.match.events.length) state.match.events = [...base.events];
-
-    const m = state.match;
-    const awayPoss = 100 - m.possessionHome;
-    const progress = Math.min(100,(m.minute/90)*100);
-
-    root.innerHTML = `
+    const squad = await GameService.getSquad();
+    const awayPoss = base.possessionAway ?? (100-base.possessionHome);
+    const progress=Math.min(100,(Number(base.minute||0)/90)*100);
+    root.innerHTML=`
       <div class="match-layout">
         <div class="stack">
           <article class="card section-card">
-            <div class="section-head">
-              <div>
-                <p class="eyebrow">${m.running ? "LIVE" : m.minute>=90 ? "FULL TIME" : "PRE-MATCH"}</p>
-                <h2>${base.venue}</h2>
-                <p>${base.kickoff} · Frontend mock preview · production server target: 96 ticks / ±8 real minutes</p>
-              </div>
-              <span class="badge ${m.running?"live":""}">${m.minute>=90?"FT":m.minute+"'"} </span>
-            </div>
-
-            <div class="scoreboard">
-              <div class="score-main">
-                <div class="score-team">
-                  <div class="team-logo">${base.homeShort}</div>
-                  <strong>${base.home}</strong>
-                </div>
-                <div class="score-centre">
-                  <strong>${m.homeScore} – ${m.awayScore}</strong>
-                  <span>${m.minute>=90?"Full Time":m.running?m.minute+"'":"Ready"}</span>
-                </div>
-                <div class="score-team">
-                  <div class="team-logo">${base.awayShort}</div>
-                  <strong>${base.away}</strong>
-                </div>
-              </div>
-              <div class="match-progress"><i style="width:${progress}%"></i></div>
-              <div class="match-controls">
-                <button class="secondary-btn" type="button" id="matchResetBtn">Reset</button>
-                <button class="primary-btn" style="margin:0" type="button" id="matchStartBtn">${m.running?"Advance 5'":m.minute>=90?"Restart Preview":"Start / Advance 5'"}</button>
-              </div>
-            </div>
+            <div class="section-head"><div><p class="eyebrow">${base.status}</p><h2>${base.venue}</h2><p>${base.kickoff} · Server authoritative match state</p></div><span class="badge ${base.isLive?'live':''}">${base.minute||0}'</span></div>
+            <div class="scoreboard"><div class="score-main"><div class="score-team"><div class="team-logo">${base.homeShort}</div><strong>${base.home}</strong></div><div class="score-centre"><strong>${base.homeScore} – ${base.awayScore}</strong><span>${base.status}</span></div><div class="score-team"><div class="team-logo">${base.awayShort}</div><strong>${base.away}</strong></div></div><div class="match-progress"><i style="width:${progress}%"></i></div><button class="primary-btn" id="refreshLiveMatchBtn" type="button">Refresh Server Match State</button></div>
           </article>
-
-          <article class="card section-card">
-            <div class="section-head">
-              <div><p class="eyebrow">MATCH STATS</p><h2>Live Statistics</h2></div>
-            </div>
-            <div class="match-stat-grid">
-              <div class="match-stat"><span>Possession</span><strong>${m.possessionHome}% – ${awayPoss}%</strong></div>
-              <div class="match-stat"><span>Shots</span><strong>${m.shotsHome} – ${m.shotsAway}</strong></div>
-              <div class="match-stat"><span>Shots on Target</span><strong>${m.sotHome} – ${m.sotAway}</strong></div>
-              <div class="match-stat"><span>xG</span><strong>${m.xgHome.toFixed(2)} – ${m.xgAway.toFixed(2)}</strong></div>
-              <div class="match-stat"><span>Corners</span><strong>${m.cornersHome} – ${m.cornersAway}</strong></div>
-              <div class="match-stat"><span>Fouls</span><strong>${m.foulsHome} – ${m.foulsAway}</strong></div>
-              <div class="match-stat"><span>Cards</span><strong>${m.cardsHome} – ${m.cardsAway}</strong></div>
-              <div class="match-stat"><span>Pass Accuracy</span><strong>${m.passAccHome}% – ${m.passAccAway}%</strong></div>
-              <div class="match-stat"><span>Avg Fitness</span><strong>${m.fitnessHome}% – ${m.fitnessAway}%</strong></div>
-              <div class="match-stat"><span>Subs Used</span><strong>${state.matchLive.subsUsed} / 5</strong></div>
-            </div>
-          </article>
-          <article class="card section-card"><div class="section-head"><div><p class="eyebrow">LIVE TACTICS</p><h2>In-Match Controls</h2><p>Cooldown ±30 seconds; changes apply on the next server tick.</p></div><span class="badge">${state.matchLive.tacticsCooldown?state.matchLive.tacticsCooldown+"s cooldown":"Ready"}</span></div>
-            <div class="live-control-grid"><div class="live-control-card"><label class="kpi-label">Mentality</label><select class="game-select" id="liveMentality" style="width:100%">${["Defensive","Cautious","Balanced","Positive","Attacking"].map(v=>`<option ${v===state.matchLive.liveMentality?"selected":""}>${v}</option>`).join("")}</select></div><div class="live-control-card"><label class="kpi-label">Pressing</label><select class="game-select" id="livePressing" style="width:100%">${["Low Block","Standard","High Press","Very High Press"].map(v=>`<option ${v===state.matchLive.livePressing?"selected":""}>${v}</option>`).join("")}</select></div></div>
-            <button class="secondary-btn" style="width:100%;margin-top:10px" id="applyLiveTacticsBtn" ${state.matchLive.tacticsCooldown?"disabled":""} type="button">Apply Live Tactics</button>
-          </article>
-          <article class="card section-card"><div class="section-head"><div><p class="eyebrow">LIVE SUBSTITUTION</p><h2>Matchday Changes</h2><p>Maximum 5 substitutions.</p></div></div><div class="live-sub-list"><div class="live-sub-row"><strong>Demo Player 18</strong><span>RW</span><strong>Demo Player 16</strong><button class="secondary-btn" id="makeSubBtn" ${state.matchLive.subsUsed>=5?"disabled":""}>Make Sub</button></div></div></article>
-          <article class="card section-card"><div class="section-head"><div><p class="eyebrow">PLAYER RATINGS</p><h2>Live Ratings</h2><p>Position-sensitive 5.0–10.0 scale.</p></div></div><div class="match-rating-grid">${window.MockDB.matchCentre.playerRatings.map(r=>`<div class="rating-card"><strong>${r.name}</strong><span>${r.pos} · ${r.club}</span><span class="rating-score">${r.rating.toFixed(1)}</span></div>`).join("")}</div></article>
+          <article class="card section-card"><div class="section-head"><div><p class="eyebrow">MATCH STATS</p><h2>Server Statistics</h2></div></div><div class="match-stat-grid"><div class="match-stat"><span>Possession</span><strong>${Number(base.possessionHome||50).toFixed(0)}% – ${Number(awayPoss||50).toFixed(0)}%</strong></div><div class="match-stat"><span>Shots</span><strong>${base.shotsHome||0} – ${base.shotsAway||0}</strong></div><div class="match-stat"><span>Shots on Target</span><strong>${base.sotHome||0} – ${base.sotAway||0}</strong></div><div class="match-stat"><span>xG</span><strong>${Number(base.xgHome||0).toFixed(2)} – ${Number(base.xgAway||0).toFixed(2)}</strong></div></div></article>
+          <article class="card section-card"><div class="section-head"><div><p class="eyebrow">LIVE TACTICS</p><h2>In-Match Controls</h2><p>Only available while server session is LIVE.</p></div></div><div class="live-control-grid"><div class="live-control-card"><label class="kpi-label">Mentality</label><select class="game-select" id="liveMentality" style="width:100%">${["Defensive","Cautious","Balanced","Positive","Attacking"].map(v=>`<option>${v}</option>`).join("")}</select></div><div class="live-control-card"><label class="kpi-label">Pressing</label><select class="game-select" id="livePressing" style="width:100%">${["Low Block","Standard","High Press","Very High Press"].map(v=>`<option>${v}</option>`).join("")}</select></div></div><button class="secondary-btn" style="width:100%;margin-top:10px" id="applyLiveTacticsBtn" ${base.isLive?'':'disabled'}>Apply Live Tactics</button></article>
+          <article class="card section-card"><div class="section-head"><div><p class="eyebrow">LIVE SUBSTITUTION</p><h2>Frozen Match Squad</h2><p>Server validates frozen XI/bench and max 5 substitutions.</p></div></div><div class="tactic-control-grid"><div class="tactic-control"><label>Player Out</label><select class="game-select" id="liveSubOut">${squad.map(p=>`<option value="${p.id}">${p.name} · ${p.pos}</option>`).join("")}</select></div><div class="tactic-control"><label>Player In</label><select class="game-select" id="liveSubIn">${squad.map(p=>`<option value="${p.id}">${p.name} · ${p.pos}</option>`).join("")}</select></div></div><button class="secondary-btn" id="makeSubBtn" style="width:100%;margin-top:10px" ${base.isLive?'':'disabled'}>Submit Substitution</button></article>
+          <article class="card section-card"><div class="section-head"><div><p class="eyebrow">PLAYER RATINGS</p><h2>Match Ratings</h2></div></div><div class="match-rating-grid">${(base.playerRatings||[]).map(r=>`<div class="rating-card"><strong>${r.name}</strong><span>${r.pos} · ${r.club}</span><span class="rating-score">${Number(r.rating).toFixed(1)}</span></div>`).join("")||'<div class="subtext">Ratings appear after server match stats are available.</div>'}</div></article>
         </div>
-
-        <aside class="card section-card">
-          <div class="section-head">
-            <div><p class="eyebrow">TIMELINE</p><h2>Match Events</h2></div>
-          </div>
-          <div class="event-timeline">
-            ${[...m.events].reverse().map(e=>`
-              <div class="event-row">
-                <div class="event-minute">${e.minute}'</div>
-                <div class="event-icon">${matchEventIcon(e.type)}</div>
-                <div><strong>${e.text}</strong></div>
-              </div>
-            `).join("")}
-          </div>
-        </aside>
-      </div>
-    `;
-
-    document.getElementById("matchStartBtn").addEventListener("click",()=>{
-      if (m.minute >= 90) {
-        state.match = {
-          running:true,minute:0,homeScore:0,awayScore:0,shotsHome:0,shotsAway:0,
-          sotHome:0,sotAway:0,xgHome:0,xgAway:0,possessionHome:52,
-          cornersHome:0,cornersAway:0,foulsHome:0,foulsAway:0,cardsHome:0,cardsAway:0,passAccHome:86,passAccAway:84,fitnessHome:93,fitnessAway:92,
-          events:[{minute:0,type:"info",text:"Kickoff — mock simulation restarted."}]
-        };
-      } else {
-        m.running = true;
-        if(state.matchLive.tacticsCooldown>0) state.matchLive.tacticsCooldown=Math.max(0,state.matchLive.tacticsCooldown-5);
-        m.fitnessHome=Math.max(55,+(m.fitnessHome-0.35).toFixed(1)); m.fitnessAway=Math.max(55,+(m.fitnessAway-0.34).toFixed(1));
-        const start = m.minute + 1;
-        m.minute = Math.min(90,m.minute+5);
-        for (let minute=start; minute<=m.minute; minute++) {
-          const evt = generateMockEvent(minute);
-          if (evt) m.events.push(evt);
-        }
-        m.possessionHome = Math.max(42,Math.min(60,m.possessionHome + (Math.random()*4-2)));
-        if (m.minute >= 90) {
-          m.running = false;
-          m.events.push({minute:90,type:"info",text:"Full time."});
-        }
-      }
-      renderMatch();
-    });
-
-    document.getElementById("applyLiveTacticsBtn")?.addEventListener("click",()=>{if(state.matchLive.tacticsCooldown>0)return;state.matchLive.liveMentality=document.getElementById("liveMentality").value;state.matchLive.livePressing=document.getElementById("livePressing").value;state.matchLive.tacticsCooldown=30;m.events.push({minute:m.minute,type:"info",text:`Live tactics: ${state.matchLive.liveMentality}, ${state.matchLive.livePressing}.`});renderMatch();});
-    document.getElementById("makeSubBtn")?.addEventListener("click",()=>{if(state.matchLive.subsUsed>=5)return;state.matchLive.subsUsed++;m.events.push({minute:m.minute,type:"sub",text:"MS7 FC: Demo Player 16 replaces Demo Player 18."});renderMatch();});
-
-    document.getElementById("matchResetBtn").addEventListener("click",()=>{
-      state.match = {
-        running:false,minute:0,homeScore:0,awayScore:0,shotsHome:0,shotsAway:0,
-        sotHome:0,sotAway:0,xgHome:0,xgAway:0,possessionHome:52,
-        cornersHome:0,cornersAway:0,foulsHome:0,foulsAway:0,cardsHome:0,cardsAway:0,passAccHome:86,passAccAway:84,fitnessHome:93,fitnessAway:92,
-        events:[{minute:0,type:"info",text:"Match Centre ready. Start mock simulation to preview live flow."}]
-      };
-      renderMatch();
-    });
+        <aside class="card section-card"><div class="section-head"><div><p class="eyebrow">TIMELINE</p><h2>Server Events</h2></div></div><div class="event-timeline">${[...(base.events||[])].reverse().map(e=>`<div class="event-row"><div class="event-minute">${e.minute}'</div><div class="event-icon">${matchEventIcon(e.type)}</div><div><strong>${e.text}</strong></div></div>`).join("")}</div></aside>
+      </div>`;
+    document.getElementById('refreshLiveMatchBtn')?.addEventListener('click',()=>renderMatch());
+    document.getElementById('applyLiveTacticsBtn')?.addEventListener('click',async()=>{try{await GameService.submitLiveTactics(base.fixtureId,{mentality:document.getElementById('liveMentality').value,press:document.getElementById('livePressing').value});showToast('Live tactics accepted by server; applies next tick.');}catch(err){showToast(`Live tactics gagal: ${err.message}`);}await renderMatch();});
+    document.getElementById('makeSubBtn')?.addEventListener('click',async()=>{const outId=document.getElementById('liveSubOut').value,inId=document.getElementById('liveSubIn').value;if(outId===inId){showToast('Player in/out harus berbeda.');return;}try{await GameService.submitLiveSubstitution(base.fixtureId,outId,inId);showToast('Substitution accepted by server.');}catch(err){showToast(`Sub gagal: ${err.message}`);}await renderMatch();});
   }
 
   async function renderClub() {
@@ -4969,9 +5221,13 @@ window.GameService = (() => {
           </div>
         </article>`;
       content.querySelectorAll("[data-facility-upgrade]").forEach(btn=>{
-        btn.addEventListener("click",()=>{
-          const f = facilities[Number(btn.dataset.facilityUpgrade)];
-          showToast(`${f.type} upgrade preview: ${money(f.upgradeCost)} (mock).`);
+        btn.addEventListener("click",async()=>{
+          const f=facilities[Number(btn.dataset.facilityUpgrade)];
+          if(!f.upgradeCost){showToast(`${f.type} sudah max level.`);return;}
+          if(!confirm(`Upgrade ${f.type} for ${money(f.upgradeCost)}?`))return;
+          btn.disabled=true;
+          try{await GameService.upgradeFacility(f.facilityKey);showToast(`${f.type} upgraded server-side.`);}catch(err){showToast(`Upgrade gagal: ${err.message}`);}
+          await renderClub();
         });
       });
     } else if (state.clubView.tab === "trophies") {
@@ -5039,16 +5295,9 @@ window.GameService = (() => {
       btn.addEventListener("click",()=>{state.inbox.filter=btn.dataset.inboxFilter;renderInbox();});
     });
     root.querySelectorAll("[data-note-read]").forEach(btn=>{
-      btn.addEventListener("click",()=>{
-        const note = window.MockDB.notifications.find(n=>n.id===btn.dataset.noteRead);
-        if (note) note.read=true;
-        refreshNotificationCounts(); renderInbox();
-      });
+      btn.addEventListener("click",async()=>{try{await GameService.markNotificationRead(btn.dataset.noteRead);showToast("Notification marked read.");}catch(err){showToast(`Read gagal: ${err.message}`);}await refreshNotificationCounts();await renderInbox();});
     });
-    document.getElementById("markAllReadBtn")?.addEventListener("click",()=>{
-      window.MockDB.notifications.forEach(n=>n.read=true);
-      refreshNotificationCounts(); renderInbox();
-    });
+    document.getElementById("markAllReadBtn")?.addEventListener("click",async()=>{try{const c=state.inbox.filter;await GameService.markAllNotificationsRead(["Match","Transfer","Player","Finance","League"].includes(c)?c.toUpperCase():null);showToast("Notifications marked read.");}catch(err){showToast(`Mark all gagal: ${err.message}`);}await refreshNotificationCounts();await renderInbox();});
   }
 
   async function renderSeason() {
@@ -5131,7 +5380,7 @@ window.GameService = (() => {
     } else if(state.adminView.tab==="technical"){
       c.innerHTML=`<article class="card section-card"><div class="section-head"><div><p class="eyebrow">TECHNICAL FAILURE</p><h2>Rerun Only Failed Matches</h2><p>No manual-winner control exists.</p></div></div>${admin.technicalFailures.map(f=>`<div class="admin-user"><div><strong>${f.fixture}</strong><span>${f.reason}</span></div><span>${f.status}</span><button class="secondary-btn" data-rerun-failure="${f.id}">Rerun</button></div>`).join("")}<div class="finance-warning">Admin cannot choose who wins. Match outcome remains engine-controlled.</div></article>`;
     } else if(state.adminView.tab==="world"){
-      c.innerHTML=`<div class="admin-grid"><article class="card section-card"><div class="section-head"><div><p class="eyebrow">WORLD CONTROL</p><h2>${admin.world.name}</h2></div></div><div class="admin-control-grid"><div class="admin-control"><span>Active Managers</span><strong>${admin.world.activeManagers}</strong></div><div class="admin-control"><span>Season</span><strong>${admin.world.season}</strong></div><div class="admin-control"><span>Phase</span><strong>${admin.world.phase}</strong></div><div class="admin-control"><span>Scheduler</span><strong>${admin.world.matchScheduler?'ON':'OFF'}</strong></div></div><div class="auth-form" style="margin-top:14px"><div class="auth-field"><label>Maximum Managers</label><input class="auth-input" id="maxManagersInput" type="number" min="1" max="18" value="${admin.world.maxManagers}"></div><div class="auth-field"><label>Phase</label><select class="game-select" id="adminPhaseSelect">${["PRESEASON","FIRST_HALF","MIDSEASON_BREAK","SECOND_HALF","OFFSEASON"].map(p=>`<option ${p===admin.world.phase?'selected':''}>${p}</option>`).join("")}</select></div><button class="secondary-btn" id="saveWorldBtn">Save World Settings</button><button class="secondary-btn" id="adminSchedulerBtn">${admin.world.matchScheduler?'Pause':'Resume'} Scheduler</button><button class="secondary-btn" id="adminTransferBtn">${admin.world.transferWindow?'Close':'Open'} Transfer Window</button><button class="secondary-btn" id="adminRolloverBtn">Run Season Rollover (Mock)</button></div></article><aside class="card section-card"><div class="finance-warning">Rollover order is fixed: standings → awards/prizes → development → age → decline → retirement → contracts → free agents → sponsorship/budget → offseason → new season.</div></aside></div>`;
+      c.innerHTML=`<div class="admin-grid"><article class="card section-card"><div class="section-head"><div><p class="eyebrow">WORLD CONTROL</p><h2>${admin.world.name}</h2></div></div><div class="admin-control-grid"><div class="admin-control"><span>Active Managers</span><strong>${admin.world.activeManagers}</strong></div><div class="admin-control"><span>Season</span><strong>${admin.world.season}</strong></div><div class="admin-control"><span>Phase</span><strong>${admin.world.phase}</strong></div><div class="admin-control"><span>Scheduler</span><strong>${admin.world.matchScheduler?'ON':'OFF'}</strong></div></div><div class="auth-form" style="margin-top:14px"><div class="auth-field"><label>Maximum Managers</label><input class="auth-input" id="maxManagersInput" type="number" min="1" max="18" value="${admin.world.maxManagers}"></div><div class="auth-field"><label>Phase</label><select class="game-select" id="adminPhaseSelect">${["PRESEASON","FIRST_HALF","MIDSEASON_BREAK","SECOND_HALF","OFFSEASON"].map(p=>`<option ${p===admin.world.phase?'selected':''}>${p}</option>`).join("")}</select></div><button class="secondary-btn" id="saveWorldBtn">Save World Settings</button><button class="secondary-btn" id="adminSchedulerBtn">${admin.world.matchScheduler?'Pause':'Resume'} Scheduler</button><button class="secondary-btn" id="adminTransferBtn">${admin.world.transferWindow?'Close':'Open'} Transfer Window</button><button class="secondary-btn" id="adminRolloverBtn">Run Season Rollover (Admin tool)</button></div></article><aside class="card section-card"><div class="finance-warning">Rollover order is fixed: standings → awards/prizes → development → age → decline → retirement → contracts → free agents → sponsorship/budget → offseason → new season.</div></aside></div>`;
     } else {
       c.innerHTML=`<article class="card table-card"><div class="section-card"><div class="section-head"><div><p class="eyebrow">ADMIN AUDIT LOG</p><h2>Transparent Privileged Actions</h2><p>Timestamp, old value, new value and reason are preserved.</p></div></div></div><div class="table-wrap"><table class="admin-table"><thead><tr><th>Timestamp</th><th>Action</th><th>Entity</th><th>Old</th><th>New</th><th>Reason</th></tr></thead><tbody>${admin.auditLog.map(a=>`<tr><td>${a.time}</td><td>${a.action}</td><td>${a.entity}</td><td>${a.oldValue||'—'}</td><td>${a.newValue||'—'}</td><td>${a.reason}</td></tr>`).join("")}</tbody></table></div></article>`;
     }
@@ -5171,6 +5420,8 @@ window.GameService = (() => {
           ${fact("Wage", wage(p.wage))}
           ${fact("Reference Season", p.refSeason)}
           ${fact("Reference Club", p.refClub)}
+          ${fact("Reference Age", p.refAge ?? "-")}
+          ${fact("Career Stage", p.careerStage || "-")}
           ${fact("Primary / Secondary", p.pos + " / " + (p.secondary||"-"))}
           ${fact("Injury", p.injury?.level||"None")}
           ${fact("Suspension", p.suspension?.active ? p.suspension.matches+" match" : "None")}
@@ -5183,7 +5434,7 @@ window.GameService = (() => {
       <div class="attributes"><h3>Season Statistics</h3><div class="player-facts">${fact("Appearances",p.stats?.appearances??0)}${fact("Starts",p.stats?.starts??0)}${fact("Minutes",p.stats?.minutes??0)}${fact("Goals",p.stats?.goals??0)}${fact("Assists",p.stats?.assists??0)}${fact("Avg Rating",p.stats?.avgRating??"-")}${fact("Clean Sheets",p.stats?.cleanSheets??0)}</div></div>
       <div class="attributes"><h3>Injury / Availability</h3><div class="player-facts">${fact("Level",p.injury?.level||"None")}${fact("Matches Affected",p.injury?.matchesAffected??0)}${fact("Playable",p.injury?.playable===false?"No":"Yes")}${fact("Expected Return Fitness",(p.injury?.returnFitness??p.fitness)+"%")}</div></div>
       <div class="attributes"><h3>Development Outlook</h3><div class="player-facts">${fact("Age Multiplier",p.age<=20?"1.35×":p.age<=22?"1.25×":p.age<=24?"1.15×":p.age<=26?"1.00×":p.age<=28?"0.85×":p.age<=30?"0.60×":p.age<=32?"0.35×":"0.15×")}${fact("Season Growth Band",p.age<=24?"Typically +1 to +3 OVR":p.age<=28?"Typically 0 to +1 OVR":"Stable / decline risk")}${fact("Potential",p.potential)}${fact("Retirement Risk",p.retirementRisk||"Low")}</div><div class="subtext">Potential remains a hidden soft ceiling; only the label is shown. Physical attributes decline earlier than technical/positioning attributes.</div></div>
-      <div class="attributes"><h3>Contract Actions</h3><div class="contract-panel"><div class="contract-actions"><select id="renewContractYears" class="game-select">${[1,2,3].map(y=>`<option value="${y}">${y} season${y>1?'s':''}</option>`).join("")}</select><button class="secondary-btn" id="renewContractBtn">Renew Contract</button><button class="reject-btn" id="releasePlayerBtn">Release Player</button></div><div class="subtext">Contract max 3 seasons. Early release compensation: approximately 30–50% remaining wages.</div></div></div>
+      <div class="attributes"><h3>Contract Actions</h3><div class="contract-panel"><div class="contract-actions"><select id="renewContractYears" class="game-select">${[1,2,3].map(y=>`<option value="${y}">${y} season${y>1?'s':''}</option>`).join("")}</select><button class="secondary-btn" id="renewContractBtn">Renew Contract</button><button class="secondary-btn" id="listTransferBtn">List for Transfer</button><button class="reject-btn" id="releasePlayerBtn">Release Player</button></div><div class="subtext">Contract max 3 seasons. Early release compensation: approximately 30–50% remaining wages.</div></div></div>
       <div class="attributes"><h3>Game Career History</h3><div class="table-wrap"><table class="career-table"><thead><tr><th>Season</th><th>Club</th><th>Apps</th><th>Goals</th><th>Assists</th><th>Rating</th></tr></thead><tbody>${(p.careerHistory||[]).map(h=>`<tr><td>${h.season}</td><td>${h.club}</td><td>${h.apps}</td><td>${h.goals}</td><td>${h.assists}</td><td>${h.rating}</td></tr>`).join("")}</tbody></table></div></div>
 
       <div class="attributes">
@@ -5200,8 +5451,9 @@ window.GameService = (() => {
       </div>
     `;
 
-    document.getElementById("renewContractBtn")?.addEventListener("click",()=>{const y=Number(document.getElementById("renewContractYears").value);p.contract=y;showToast(`${p.name} renewed for ${y} season${y>1?'s':''} (mock).`);});
-    document.getElementById("releasePlayerBtn")?.addEventListener("click",()=>showToast(`${p.name} release flow opened; compensation 30–50% remaining wages (mock).`));
+    document.getElementById("renewContractBtn")?.addEventListener("click",async()=>{const y=Number(document.getElementById("renewContractYears").value);try{await GameService.renewContract(p.id,y,p.wage);showToast(`${p.name}: renewal ${y} season queued server-side.`);}catch(err){showToast(`Renew gagal: ${err.message}`);}});
+    document.getElementById("listTransferBtn")?.addEventListener("click",async()=>{const ask=Number(prompt(`Asking price for ${p.name} (£)`,String(Math.max(1000000,Math.round(p.ovr*p.ovr*4000)))));if(!ask)return;try{await GameService.listPlayerForTransfer(p.id,ask);showToast(`${p.name} listed for ${money(ask)}.`);playerDialog.close();}catch(err){showToast(`Listing gagal: ${err.message}`);}});
+    document.getElementById("releasePlayerBtn")?.addEventListener("click",async()=>{if(!confirm(`Release ${p.name}? Server will enforce minimum 18 squad and 2 GK.`))return;try{await GameService.releasePlayer(p.id);showToast(`${p.name} released server-side.`);playerDialog.close();await render();}catch(err){showToast(`Release gagal: ${err.message}`);}});
     playerDialog.showModal();
   }
 
@@ -5248,405 +5500,5 @@ window.GameService = (() => {
 })();
 
 </script>
-
-<style>
-/* ===========================
-   PHASE 20B - REAL GAMEPLAY BRIDGE V1
-   =========================== */
-#realAlphaRoot{position:fixed;inset:0;z-index:500;background:#07150d;color:#f7f9fc;overflow:auto}
-.rag-shell{min-height:100vh;display:grid;grid-template-columns:230px minmax(0,1fr)}
-.rag-side{position:sticky;top:0;height:100vh;padding:18px 14px;border-right:1px solid #244331;background:#06120c;display:flex;flex-direction:column;gap:14px}
-.rag-brand{padding:10px;border:1px solid #244331;border-radius:14px;background:#0a1d12}
-.rag-brand b{display:block;font-size:14px}.rag-brand small{color:#86a792}
-.rag-badge{display:inline-flex;margin-top:8px;padding:5px 8px;border-radius:999px;border:1px solid #5f7520;color:#d8ff70;font-size:9px;font-weight:900}
-.rag-nav{display:grid;gap:6px}
-.rag-nav button{min-height:42px;text-align:left;border:0;border-radius:10px;padding:0 11px;background:transparent;color:#99ad9f;font-weight:800}
-.rag-nav button:hover,.rag-nav button.active{background:#10331d;color:#cfff5e}
-.rag-side-foot{margin-top:auto;font-size:10px;color:#789082}
-.rag-main{min-width:0}
-.rag-top{position:sticky;top:0;z-index:5;display:flex;justify-content:space-between;gap:12px;align-items:center;padding:16px 22px;background:rgba(7,21,13,.94);border-bottom:1px solid #244331;backdrop-filter:blur(10px)}
-.rag-top h1{font-size:21px;margin:0}.rag-top p{margin:3px 0 0;font-size:10px;color:#8aa092}
-.rag-top-actions{display:flex;gap:8px;align-items:center}
-.rag-btn{min-height:38px;padding:0 12px;border-radius:10px;border:1px solid #315840;background:#0e2919;color:#eaf6ed;font-weight:800;cursor:pointer}
-.rag-btn.primary{background:#b7f52a;color:#102007;border-color:#b7f52a}
-.rag-btn.danger{border-color:#7f3340;color:#ff9baa;background:#261116}
-.rag-btn:disabled{opacity:.5;cursor:not-allowed}
-.rag-content{padding:22px;max-width:1500px;margin:auto}
-.rag-grid{display:grid;gap:14px}
-.rag-kpis{grid-template-columns:repeat(4,minmax(0,1fr));margin-bottom:14px}
-.rag-card{border:1px solid #244331;background:#0a1d12;border-radius:15px;padding:16px}
-.rag-card h2{font-size:15px;margin:0 0 10px}.rag-card h3{font-size:12px;margin:0 0 8px}
-.rag-muted{color:#8aa092;font-size:10px}
-.rag-kpi span{display:block;color:#86a792;font-size:9px;text-transform:uppercase}.rag-kpi strong{display:block;font-size:22px;margin-top:5px}
-.rag-table-wrap{overflow:auto;border:1px solid #244331;border-radius:13px}
-.rag-table{width:100%;border-collapse:collapse;min-width:780px}
-.rag-table th,.rag-table td{padding:10px 11px;border-bottom:1px solid #193624;font-size:10px;text-align:left}
-.rag-table th{font-size:9px;color:#7f9988;background:#08180f;position:sticky;top:0}
-.rag-pill{display:inline-flex;min-height:23px;align-items:center;padding:0 7px;border-radius:999px;border:1px solid #315840;font-size:9px;font-weight:900}
-.rag-pill.good{color:#84e69b;border-color:#326943}.rag-pill.warn{color:#ffd66a;border-color:#6e5c27}.rag-pill.bad{color:#ff99a7;border-color:#743744}
-.rag-form{display:flex;gap:8px;flex-wrap:wrap;align-items:end}
-.rag-field{display:grid;gap:5px;min-width:150px;flex:1}.rag-field label{font-size:9px;color:#86a792;font-weight:800}
-.rag-field input,.rag-field select{min-height:39px;border-radius:9px;border:1px solid #315840;background:#08180f;color:white;padding:0 10px}
-.rag-player-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
-.rag-player{padding:12px;border:1px solid #244331;border-radius:12px;background:#08180f}
-.rag-player-head{display:flex;justify-content:space-between;gap:10px}.rag-player strong{font-size:11px}.rag-player small{display:block;color:#8aa092;margin-top:3px}
-.rag-ovr{min-width:35px;height:35px;border-radius:50%;display:grid;place-items:center;background:#143722;border:1px solid #4d7a5c;color:#cfff5e;font-weight:900}
-.rag-hist{margin-top:9px;padding-top:8px;border-top:1px solid #193624;font-size:9px;color:#9aafa0;line-height:1.55}
-.rag-xi{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.rag-xi-row{padding:9px;border:1px solid #244331;border-radius:10px;background:#08180f;font-size:10px}
-.rag-note{padding:11px;border:1px solid #4e5d23;border-radius:10px;background:#1b230d;color:#d6e891;font-size:10px;line-height:1.5}
-.rag-error{padding:11px;border:1px solid #743744;border-radius:10px;background:#261116;color:#ffb0bb;font-size:10px;white-space:pre-wrap}
-.rag-success{padding:11px;border:1px solid #326943;border-radius:10px;background:#0e2b19;color:#9be9ac;font-size:10px}
-.rag-two{grid-template-columns:minmax(0,1.25fr) minmax(300px,.75fr)}
-.rag-list{display:grid;gap:8px}.rag-list-row{padding:10px;border:1px solid #244331;border-radius:10px;background:#08180f;display:flex;justify-content:space-between;gap:10px;align-items:center}
-.rag-list-row b{font-size:10px}.rag-list-row small{display:block;color:#8aa092;margin-top:3px}
-.rag-live-event{display:grid;grid-template-columns:42px minmax(0,1fr);gap:8px;padding:7px 0;border-bottom:1px solid #193624;font-size:10px}
-.rag-toast{position:fixed;right:18px;bottom:18px;z-index:600;padding:11px 14px;border-radius:10px;background:#0e2919;border:1px solid #4d7a5c;opacity:0;transform:translateY(8px);transition:.2s;max-width:360px;font-size:10px}
-.rag-toast.show{opacity:1;transform:none}
-@media(max-width:1050px){.rag-player-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.rag-two{grid-template-columns:1fr}.rag-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media(max-width:760px){.rag-shell{grid-template-columns:1fr}.rag-side{position:static;height:auto}.rag-nav{grid-template-columns:repeat(4,minmax(0,1fr))}.rag-nav button{text-align:center;padding:0 4px;font-size:9px}.rag-side-foot{display:none}.rag-top{padding:12px 14px}.rag-content{padding:14px}.rag-player-grid{grid-template-columns:1fr}.rag-kpis{grid-template-columns:1fr 1fr}.rag-xi{grid-template-columns:1fr}}
-</style>
-
-<script>
-window.RealAlphaGame = (() => {
-  const db = () => window.AlphaService.client;
-  const S = {ctx:null, view:"home", root:null, content:null, channel:null, cache:{}};
-
-  const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-  const money = n => "£" + Number(n || 0).toLocaleString("en-GB");
-  const fmtDate = v => v ? new Intl.DateTimeFormat("id-ID",{dateStyle:"medium",timeStyle:v.includes?.("T")?"short":undefined,timeZone:"Asia/Jakarta"}).format(new Date(v)) : "—";
-  const errText = e => [e?.message,e?.details,e?.hint,e?.code].filter(Boolean).join(" · ") || String(e);
-  function toast(msg){ let t=document.getElementById("ragToast"); if(!t)return; t.textContent=msg;t.classList.add("show");clearTimeout(toast.t);toast.t=setTimeout(()=>t.classList.remove("show"),2600); }
-  function must({data,error}, label){ if(error){const e=new Error(error.message||label);e.details=error.details;e.hint=error.hint;e.code=error.code;throw e;} return data; }
-  function card(title, body, extra=""){ return `<section class="rag-card ${extra}"><h2>${esc(title)}</h2>${body}</section>`; }
-
-  async function context(){
-    const session=await window.AlphaService.getSession();
-    if(!session?.user) throw new Error("Session Alpha tidak ditemukan.");
-    const profile=await window.AlphaService.getProfile(session.user.id);
-    const world=await window.AlphaService.getWorld();
-    const club=await window.AlphaService.getMyClub(session.user.id);
-    if(!club) throw new Error("Club belum dibuat.");
-    const seasonRows=must(await db().from("seasons").select("*").eq("world_id",world.id).eq("season_number",world.current_season_number).limit(1),"SEASON");
-    const season=seasonRows?.[0];
-    if(!season) throw new Error("Current season tidak ditemukan.");
-    return {session,profile,world,club,season};
-  }
-
-  async function squad(){
-    const club=S.ctx.club;
-    const states=must(await db().from("player_state").select("player_id,current_age,current_ovr,current_tier,fitness,form,retirement_risk").eq("current_club_id",club.id).eq("ownership_status","owned").order("current_ovr",{ascending:false}),"SQUAD_STATE")||[];
-    if(!states.length) return [];
-    const ids=states.map(x=>x.player_id);
-    const [pRes,cRes,rRes]=await Promise.all([
-      db().from("players").select("id,name,primary_position,secondary_positions,reference_season,reference_club,reference_age,potential_label").in("id",ids),
-      db().from("contracts").select("player_id,seasons_remaining,weekly_wage,status,renewal_seasons,renewal_weekly_wage").eq("club_id",club.id).eq("status","active"),
-      db().from("player_reference_attributes").select("player_id,reference_season,reference_club,reference_age").in("player_id",ids)
-    ]);
-    const players=must(pRes,"PLAYERS")||[], contracts=must(cRes,"CONTRACTS")||[], refs=must(rRes,"REFS")||[];
-    const pm=new Map(players.map(x=>[x.id,x])), cm=new Map(contracts.map(x=>[x.player_id,x])), rm=new Map(refs.map(x=>[x.player_id,x]));
-    return states.map(x=>({...x,...(pm.get(x.player_id)||{}),contract:cm.get(x.player_id)||null,reference:rm.get(x.player_id)||null}));
-  }
-
-  async function clubFinance(){
-    const [cs,fac,ledger]=await Promise.all([
-      db().from("club_seasons").select("*").eq("club_id",S.ctx.club.id).eq("season_id",S.ctx.season.id).maybeSingle(),
-      db().from("club_facilities").select("*").eq("club_id",S.ctx.club.id).maybeSingle(),
-      db().from("finance_ledger").select("*").eq("club_id",S.ctx.club.id).eq("season_id",S.ctx.season.id).order("created_at",{ascending:false}).limit(12)
-    ]);
-    return {season:must(cs,"CLUB_FINANCE"),facilities:must(fac,"FACILITIES"),ledger:must(ledger,"LEDGER")||[]};
-  }
-
-  async function fixtures(){
-    const rows=must(await db().from("league_fixtures").select("*").eq("season_id",S.ctx.season.id).order("matchday").order("scheduled_kickoff"),"FIXTURES")||[];
-    const clubIds=[...new Set(rows.flatMap(x=>[x.home_club_id,x.away_club_id]))];
-    const clubs=clubIds.length?must(await db().from("clubs").select("id,name,short_name").in("id",clubIds),"FIXTURE_CLUBS")||[]:[];
-    const cm=new Map(clubs.map(x=>[x.id,x]));
-    return rows.map(x=>({...x,home:cm.get(x.home_club_id),away:cm.get(x.away_club_id)}));
-  }
-
-  async function standings(){
-    const st=must(await db().from("league_standings").select("*").eq("season_id",S.ctx.season.id).order("position",{ascending:true}),"STANDINGS")||[];
-    const ids=st.map(x=>x.club_id);
-    const clubs=ids.length?must(await db().from("clubs").select("id,name,short_name").in("id",ids),"STANDING_CLUBS")||[]:[];
-    const cm=new Map(clubs.map(x=>[x.id,x]));
-    return st.map(x=>({...x,club:cm.get(x.club_id)}));
-  }
-
-  async function notificationFeed(){
-    const d=must(await db().rpc("notification_feed",{p_category:null,p_unread_only:false,p_limit:50,p_before:null}),"NOTIFICATIONS");
-    return d||[];
-  }
-
-  async function renderHome(){
-    const [sq,fin,fx,notes]=await Promise.all([squad(),clubFinance(),fixtures(),notificationFeed()]);
-    const next=fx.find(x=>["scheduled","lineup_locked","live"].includes(x.status) && (x.home_club_id===S.ctx.club.id||x.away_club_id===S.ctx.club.id));
-    const unread=notes.filter(x=>!x.is_read).length;
-    return `
-      <div class="rag-grid rag-kpis">
-        ${card("Squad",`<div class="rag-kpi"><span>Owned Players</span><strong>${sq.length}/22</strong></div>`)}
-        ${card("Season",`<div class="rag-kpi"><span>Phase</span><strong>${esc(S.ctx.season.phase)}</strong></div>`)}
-        ${card("Balance",`<div class="rag-kpi"><span>Club Cash</span><strong style="font-size:16px">${money(fin.season?.balance)}</strong></div>`)}
-        ${card("Inbox",`<div class="rag-kpi"><span>Unread</span><strong>${unread}</strong></div>`)}
-      </div>
-      <div class="rag-grid rag-two">
-        ${card("Next Match", next ? `<div class="rag-list-row"><div><b>MD${next.matchday} · ${esc(next.home?.name)} vs ${esc(next.away?.name)}</b><small>${fmtDate(next.scheduled_kickoff)} · ${esc(next.status)}</small></div><button class="rag-btn" data-rag-go="match">Match Centre</button></div>` : `<p class="rag-muted">Belum ada fixture berikutnya. Scheduler tetap OFF sampai calendar Alpha disetujui.</p>`)}
-        ${card("World State",`<div class="rag-list"><div class="rag-list-row"><b>Founding Draw</b><span class="rag-pill good">${esc(S.ctx.world.founding_draw_status)}</span></div><div class="rag-list-row"><b>Transfer Window</b><span class="rag-pill ${S.ctx.world.transfer_window_open?"good":"warn"}">${S.ctx.world.transfer_window_open?"OPEN":"CLOSED"}</span></div><div class="rag-list-row"><b>Scheduler</b><span class="rag-pill ${S.ctx.world.scheduler_enabled?"good":"warn"}">${S.ctx.world.scheduler_enabled?"ON":"OFF"}</span></div></div>`)}
-      </div>`;
-  }
-
-  async function renderSquad(){
-    const sq=await squad();
-    return `${card("Real Squad · Semua pemain dari server",`
-      <div class="rag-note">Historical identity ditampilkan di Alpha bridge ini: Reference Club, Reference Season, dan Reference Age. Jumlah di bawah berasal langsung dari <code>player_state</code>.</div>
-      <div style="height:10px"></div>
-      <div class="rag-player-grid">${sq.map(p=>`<article class="rag-player">
-        <div class="rag-player-head"><div><strong>${esc(p.name||p.player_id)}</strong><small>${esc(p.primary_position)} · Tier ${esc(p.current_tier)} · Age ${esc(p.current_age)}</small></div><div class="rag-ovr">${esc(p.current_ovr)}</div></div>
-        <div class="rag-hist"><b>Historical Reference</b><br>Club: ${esc(p.reference?.reference_club||p.reference_club||"—")}<br>Season: ${esc(p.reference?.reference_season||p.reference_season||"—")} · Reference Age: ${esc(p.reference?.reference_age??p.reference_age??"—")}<br>Fitness ${esc(p.fitness)} · Form ${esc(p.form)}<br>Contract: ${esc(p.contract?.seasons_remaining??"—")} season · ${money(p.contract?.weekly_wage||0)}/week</div>
-      </article>`).join("")}</div>`)}
-    `;
-  }
-
-  async function renderTactics(){
-    const [sq,forms,tac,lineup,ratings]=await Promise.all([
-      squad(),
-      db().from("formation_templates").select("*").order("code"),
-      db().from("club_tactics").select("*").eq("club_id",S.ctx.club.id).eq("season_id",S.ctx.season.id).maybeSingle(),
-      db().from("club_lineup_entries").select("*").eq("club_id",S.ctx.club.id).eq("season_id",S.ctx.season.id).order("role").order("slot_index"),
-      (async()=>{ const ids=(await squad()).map(x=>x.player_id); return ids.length?db().from("player_position_ratings").select("player_id,position,position_ovr,familiarity").in("player_id",ids):{data:[],error:null}; })()
-    ]);
-    const f=must(forms,"FORMATIONS")||[], t=must(tac,"TACTICS"), le=must(lineup,"LINEUP")||[], pr=must(ratings,"POSITION_RATINGS")||[];
-    S.cache.tactics={sq,f,t,le,pr};
-    const current=t?.formation_code||f[0]?.code||"4-3-3";
-    const select=(id,label,vals,val)=>`<div class="rag-field"><label>${label}</label><select id="${id}">${vals.map(x=>`<option ${x===val?"selected":""}>${esc(x)}</option>`).join("")}</select></div>`;
-    return `
-      <div class="rag-grid rag-two">
-      ${card("Formation & XI",`
-        <div class="rag-form"><div class="rag-field"><label>Formation</label><select id="ragFormation">${f.map(x=>`<option value="${esc(x.code)}" ${x.code===current?"selected":""}>${esc(x.display_name||x.code)}</option>`).join("")}</select></div><button class="rag-btn primary" id="ragAutoLineup">Auto Pick & Save XI</button></div>
-        <div style="height:12px"></div>
-        <div class="rag-xi">${le.length?le.map(x=>{const p=sq.find(q=>q.player_id===x.player_id);return `<div class="rag-xi-row"><b>${x.role==="starter"?`${x.slot_index}. ${esc(x.tactical_position)}`:`Bench ${x.slot_index}`}</b> · ${esc(p?.name||x.player_id)}</div>`}).join(""):`<p class="rag-muted">Belum ada lineup server-side. Gunakan Auto Pick & Save XI.</p>`}</div>
-      `)}
-      ${card("Team Tactics",`
-        <div class="rag-form">
-        ${select("ragMentality","Mentality",["Defensive","Cautious","Balanced","Positive","Attacking"],t?.mentality||"Balanced")}
-        ${select("ragPress","Press",["Low Block","Standard","High Press"],t?.press||"Standard")}
-        ${select("ragLine","Defensive Line",["Low","Standard","High"],t?.defensive_line||"Standard")}
-        ${select("ragTempo","Tempo",["Slow","Balanced","Fast"],t?.tempo||"Balanced")}
-        ${select("ragPassing","Passing",["Short","Mixed","Direct"],t?.passing_style||"Mixed")}
-        ${select("ragWidth","Width",["Narrow","Balanced","Wide"],t?.width||"Balanced")}
-        ${select("ragFocus","Focus",["Left","Balanced","Right","Central"],t?.focus||"Balanced")}
-        ${select("ragTransition","Transition",["Hold","Balanced","Counter"],t?.transition||"Balanced")}
-        </div><button class="rag-btn primary" id="ragSaveTactics" style="margin-top:12px">Save Real Tactics</button>
-      `)}
-      </div>`;
-  }
-
-  function pickLineup(formationCode){
-    const c=S.cache.tactics, form=c.f.find(x=>x.code===formationCode);
-    if(!form) throw new Error("Formation tidak ditemukan.");
-    const slots=form.starter_slots||[];
-    const used=new Set(), starters=[];
-    for(const pos of slots){
-      const ranked=c.sq.filter(p=>!used.has(p.player_id)).map(p=>{
-        const r=c.pr.find(x=>x.player_id===p.player_id&&String(x.position).toUpperCase()===String(pos).toUpperCase());
-        return {p,score:Number(r?.position_ovr??0)*10+Number(r?.familiarity??0)+Number(p.current_ovr||0)};
-      }).sort((a,b)=>b.score-a.score);
-      if(!ranked.length||ranked[0].score<=0) throw new Error(`Tidak ada pemain valid untuk slot ${pos}.`);
-      used.add(ranked[0].p.player_id); starters.push({player_id:ranked[0].p.player_id,position:String(pos).toUpperCase()});
-    }
-    const bench=c.sq.filter(p=>!used.has(p.player_id)).sort((a,b)=>b.current_ovr-a.current_ovr).slice(0,9).map(p=>({player_id:p.player_id}));
-    return {starters,bench};
-  }
-
-  async function renderTraining(){
-    const rows=must(await db().from("training_sessions").select("*").eq("club_id",S.ctx.club.id).eq("season_id",S.ctx.season.id).order("training_date",{ascending:false}).limit(12),"TRAINING")||[];
-    const types=["Recovery","Light","Normal","Intensive","Attacking","Defensive","Technical","Fitness"];
-    return `<div class="rag-grid rag-two">
-      ${card("Schedule Training",`<div class="rag-note">Backend menjaga unique 1 session/club/day. Scheduling di sini real; permanent growth tetap diproses server-side.</div><div class="rag-form" style="margin-top:12px"><div class="rag-field"><label>Session</label><select id="ragTrainingType">${types.map(x=>`<option>${x}</option>`).join("")}</select></div><div class="rag-field"><label>Date</label><input id="ragTrainingDate" type="date"></div><button class="rag-btn primary" id="ragScheduleTraining">Schedule</button></div>`)}
-      ${card("Training History",`<div class="rag-list">${rows.length?rows.map(x=>`<div class="rag-list-row"><div><b>${esc(x.training_date)} · ${esc(x.session_type)}</b><small>Status ${esc(x.status)} · Players ${esc(x.players_processed)} · DXP ${esc(x.total_effective_dxp)}</small></div><span class="rag-pill ${x.status==="completed"?"good":"warn"}">${esc(x.status)}</span></div>`).join(""):`<p class="rag-muted">Belum ada training session.</p>`}</div>`)}
-    </div>`;
-  }
-
-  async function renderTransfers(){
-    const [sq,listings,offers,clubs]=await Promise.all([
-      squad(),
-      db().from("transfer_listings").select("*").eq("status","listed").order("listed_at",{ascending:false}).limit(80),
-      db().from("transfer_offers").select("*").or(`buyer_club_id.eq.${S.ctx.club.id},seller_club_id.eq.${S.ctx.club.id}`).order("created_at",{ascending:false}).limit(50),
-      db().from("clubs").select("id,name,short_name").eq("world_id",S.ctx.world.id)
-    ]);
-    const ls=must(listings,"LISTINGS")||[], os=must(offers,"OFFERS")||[], cs=must(clubs,"CLUBS")||[];
-    const ids=[...new Set(ls.map(x=>x.player_id))];
-    const ps=ids.length?must(await db().from("players").select("id,name,primary_position,reference_club,reference_season").in("id",ids),"MARKET_PLAYERS")||[]:[];
-    const pm=new Map(ps.map(x=>[x.id,x])), cm=new Map(cs.map(x=>[x.id,x]));
-    return `
-      <div class="rag-grid rag-two">
-      ${card(`Transfer Market · ${S.ctx.world.transfer_window_open?"OPEN":"CLOSED"}`,`
-        <div class="rag-list">${ls.filter(x=>x.seller_club_id!==S.ctx.club.id).length?ls.filter(x=>x.seller_club_id!==S.ctx.club.id).map(x=>{const p=pm.get(x.player_id);return `<div class="rag-list-row"><div><b>${esc(p?.name||x.player_id)} · ${esc(p?.primary_position||"")}</b><small>${esc(cm.get(x.seller_club_id)?.name||"")} · Ask ${money(x.asking_price)} · ${esc(p?.reference_club||"")} ${esc(p?.reference_season||"")}</small></div><button class="rag-btn" data-rag-offer="${esc(x.player_id)}">Make Offer</button></div>`}).join(""):`<p class="rag-muted">Tidak ada listing klub lain saat ini.</p>`}</div>
-      `)}
-      ${card("List My Player",`<div class="rag-form"><div class="rag-field"><label>Player</label><select id="ragListPlayer">${sq.map(p=>`<option value="${esc(p.player_id)}">${esc(p.name)} · ${esc(p.primary_position)}</option>`).join("")}</select></div><div class="rag-field"><label>Asking Price (£)</label><input id="ragAskPrice" type="number" min="0" value="10000000"></div><button class="rag-btn primary" id="ragListBtn">List Player</button></div>`)}
-      </div>
-      ${card("My Offers",`<div class="rag-table-wrap"><table class="rag-table"><thead><tr><th>Player</th><th>Direction</th><th>Amount</th><th>Wage</th><th>Status</th></tr></thead><tbody>${os.length?os.map(o=>`<tr><td>${esc(o.player_id)}</td><td>${o.buyer_club_id===S.ctx.club.id?"BUY":"SELL"}</td><td>${money(o.buyer_amount)}</td><td>${money(o.proposed_weekly_wage)}/w</td><td>${esc(o.status)}</td></tr>`).join(""):`<tr><td colspan="5">Belum ada offer.</td></tr>`}</tbody></table></div>`)}
-    `;
-  }
-
-  async function renderLeague(){
-    const [st,fx]=await Promise.all([standings(),fixtures()]);
-    return `
-      ${card("League Standings",`<div class="rag-table-wrap"><table class="rag-table"><thead><tr><th>#</th><th>Club</th><th>P</th><th>W</th><th>D</th><th>L</th><th>GF</th><th>GA</th><th>GD</th><th>Pts</th></tr></thead><tbody>${st.length?st.map(x=>`<tr><td>${esc(x.position??"—")}</td><td>${esc(x.club?.name||x.club_id)}</td><td>${x.played}</td><td>${x.won}</td><td>${x.drawn}</td><td>${x.lost}</td><td>${x.goals_for}</td><td>${x.goals_against}</td><td>${x.goal_difference}</td><td><b>${x.points}</b></td></tr>`).join(""):`<tr><td colspan="10">Standings belum dibuat / fixture belum dimulai.</td></tr>`}</tbody></table></div>`)}
-      <div style="height:14px"></div>
-      ${card("Fixtures",`<div class="rag-list">${fx.length?fx.map(x=>`<div class="rag-list-row"><div><b>MD${x.matchday} · ${esc(x.home?.name)} vs ${esc(x.away?.name)}</b><small>${fmtDate(x.scheduled_kickoff)} · ${esc(x.status)} · Leg ${x.leg}</small></div><span class="rag-pill ${x.status==="completed"?"good":"warn"}">${esc(x.status)}</span></div>`).join(""):`<p class="rag-muted">Belum ada fixtures.</p>`}</div>`)}
-    `;
-  }
-
-  async function renderClub(){
-    const f=await clubFinance();
-    return `
-      <div class="rag-grid rag-kpis">
-       ${card("Balance",`<div class="rag-kpi"><span>Cash</span><strong style="font-size:16px">${money(f.season?.balance)}</strong></div>`)}
-       ${card("Transfer Budget",`<div class="rag-kpi"><span>Available</span><strong style="font-size:16px">${money(f.season?.transfer_budget)}</strong></div>`)}
-       ${card("Weekly Wage",`<div class="rag-kpi"><span>${money(f.season?.weekly_wage_committed)} / ${money(f.season?.wage_limit_weekly)}</span><strong>${Math.round(100*(f.season?.weekly_wage_committed||0)/(f.season?.wage_limit_weekly||1))}%</strong></div>`)}
-       ${card("Sponsor",`<div class="rag-kpi"><span>Season Value</span><strong style="font-size:16px">${money(f.season?.sponsor_value)}</strong></div>`)}
-      </div>
-      <div class="rag-grid rag-two">
-      ${card("Facilities",`<div class="rag-list">
-        ${["training","medical","stadium"].map(k=>`<div class="rag-list-row"><div><b>${k[0].toUpperCase()+k.slice(1)} Facility</b><small>Level ${esc(f.facilities?.[k+"_level"]??"—")} / 5</small></div><button class="rag-btn" data-rag-upgrade="${k}" ${(f.facilities?.[k+"_level"]||5)>=5?"disabled":""}>Upgrade</button></div>`).join("")}
-      </div>`)}
-      ${card("Recent Ledger",`<div class="rag-list">${f.ledger.length?f.ledger.map(x=>`<div class="rag-list-row"><div><b>${esc(x.category)}</b><small>${esc(x.detail)} · ${fmtDate(x.created_at)}</small></div><b>${x.amount>=0?"+":""}${money(x.amount)}</b></div>`).join(""):`<p class="rag-muted">Belum ada ledger.</p>`}</div>`)}
-      </div>`;
-  }
-
-  async function renderInbox(){
-    const notes=await notificationFeed();
-    return `${card("In-App Notifications",`<div style="display:flex;justify-content:flex-end;margin-bottom:10px"><button class="rag-btn" id="ragMarkAll">Mark All Read</button></div><div class="rag-list">${notes.length?notes.map(n=>`<div class="rag-list-row"><div><b>${esc(n.title)}</b><small>${esc(n.category)} · ${esc(n.body)} · ${fmtDate(n.created_at)}</small></div>${n.is_read?'<span class="rag-pill">READ</span>':`<button class="rag-btn" data-rag-read="${esc(n.id)}">Mark Read</button>`}</div>`).join(""):`<p class="rag-muted">Belum ada notification.</p>`}</div>`)}
-    `;
-  }
-
-  async function renderMatch(){
-    const fx=await fixtures();
-    const mine=fx.filter(x=>x.home_club_id===S.ctx.club.id||x.away_club_id===S.ctx.club.id);
-    const live=mine.find(x=>x.status==="live") || mine.find(x=>["scheduled","lineup_locked"].includes(x.status)) || mine.slice(-1)[0];
-    if(!live) return card("Match Centre",`<p class="rag-muted">Belum ada fixture untuk klub ini.</p>`);
-    const [sess,events]=await Promise.all([
-      db().from("live_match_sessions").select("*").eq("fixture_id",live.id).maybeSingle(),
-      db().from("live_match_events").select("*").eq("fixture_id",live.id).order("sequence",{ascending:false}).limit(40)
-    ]);
-    const s=must(sess,"LIVE_SESSION"), ev=must(events,"LIVE_EVENTS")||[];
-    if(s && !S.channel){
-      S.channel=db().channel(`alpha-live-${live.id}`)
-        .on("postgres_changes",{event:"*",schema:"public",table:"live_match_sessions",filter:`fixture_id=eq.${live.id}`},()=>render())
-        .on("postgres_changes",{event:"INSERT",schema:"public",table:"live_match_events",filter:`fixture_id=eq.${live.id}`},()=>render())
-        .subscribe();
-    }
-    return `
-      ${card("Match Centre",`<div class="rag-list-row"><div><b>${esc(live.home?.name)} vs ${esc(live.away?.name)}</b><small>MD${live.matchday} · ${fmtDate(live.scheduled_kickoff)} · ${esc(live.status)}</small></div>${s?`<div><b>${s.home_score} - ${s.away_score}</b><small>${s.match_minute}' · Tick ${s.current_tick}/${s.total_ticks}</small></div>`:""}</div>`)}
-      <div style="height:14px"></div>
-      ${card("Live Events",`<div>${ev.length?ev.slice().reverse().map(e=>`<div class="rag-live-event"><b>${e.match_minute}'</b><span>${esc(e.event_type)} · ${esc(e.player_id||"")}${e.xg!=null?` · xG ${esc(e.xg)}`:""}</span></div>`).join(""):`<p class="rag-muted">Belum ada live events. Realtime akan aktif ketika fixture berstatus live.</p>`}</div>`)}
-    `;
-  }
-
-  async function render(){
-    if(!S.content)return;
-    S.content.innerHTML=`<div class="rag-card"><p class="rag-muted">Loading real server data...</p></div>`;
-    try{
-      let out="";
-      if(S.view==="home") out=await renderHome();
-      else if(S.view==="squad") out=await renderSquad();
-      else if(S.view==="tactics") out=await renderTactics();
-      else if(S.view==="training") out=await renderTraining();
-      else if(S.view==="transfers") out=await renderTransfers();
-      else if(S.view==="league") out=await renderLeague();
-      else if(S.view==="match") out=await renderMatch();
-      else if(S.view==="club") out=await renderClub();
-      else if(S.view==="inbox") out=await renderInbox();
-      S.content.innerHTML=out;
-      wire();
-    }catch(e){console.error(e);S.content.innerHTML=`<div class="rag-error"><b>Server/API error</b><br>${esc(errText(e))}</div>`;}
-  }
-
-  function wire(){
-    S.content.querySelectorAll("[data-rag-go]").forEach(b=>b.onclick=()=>go(b.dataset.ragGo));
-    const auto=document.getElementById("ragAutoLineup");
-    if(auto) auto.onclick=async()=>{
-      try{
-        auto.disabled=true;
-        const formation=document.getElementById("ragFormation").value;
-        const {starters,bench}=pickLineup(formation);
-        must(await db().rpc("save_lineup",{p_formation_code:formation,p_starters:starters,p_bench:bench}),"SAVE_LINEUP");
-        toast("Lineup server-side tersimpan."); await render();
-      }catch(e){toast("Lineup gagal: "+errText(e));auto.disabled=false;}
-    };
-    const saveTac=document.getElementById("ragSaveTactics");
-    if(saveTac) saveTac.onclick=async()=>{
-      try{
-        saveTac.disabled=true;
-        const g=id=>document.getElementById(id).value;
-        must(await db().rpc("save_tactics",{p_formation_code:g("ragFormation"),p_mentality:g("ragMentality"),p_press:g("ragPress"),p_defensive_line:g("ragLine"),p_tempo:g("ragTempo"),p_passing_style:g("ragPassing"),p_width:g("ragWidth"),p_focus:g("ragFocus"),p_transition:g("ragTransition"),p_auto_sub_enabled:true}),"SAVE_TACTICS");
-        toast("Tactics server-side tersimpan."); await render();
-      }catch(e){toast("Tactics gagal: "+errText(e));saveTac.disabled=false;}
-    };
-    const tr=document.getElementById("ragScheduleTraining");
-    if(tr) tr.onclick=async()=>{
-      try{
-        tr.disabled=true; const typ=document.getElementById("ragTrainingType").value; const dt=document.getElementById("ragTrainingDate").value||null;
-        must(await db().rpc("schedule_training",{p_session_type:typ,p_training_date:dt}),"SCHEDULE_TRAINING");
-        toast("Training tersimpan."); await render();
-      }catch(e){toast("Training gagal: "+errText(e));tr.disabled=false;}
-    };
-    const lb=document.getElementById("ragListBtn");
-    if(lb) lb.onclick=async()=>{
-      try{
-        const pid=document.getElementById("ragListPlayer").value, ask=Number(document.getElementById("ragAskPrice").value);
-        must(await db().rpc("list_player_for_transfer",{p_player_id:pid,p_asking_price:ask}),"LIST_PLAYER");
-        toast("Player listed."); await render();
-      }catch(e){toast("Listing gagal: "+errText(e));}
-    };
-    S.content.querySelectorAll("[data-rag-offer]").forEach(b=>b.onclick=async()=>{
-      const amount=Number(prompt("Transfer fee (£):","10000000")); if(!Number.isFinite(amount))return;
-      const wage=Number(prompt("Proposed weekly wage (£):","50000")); if(!Number.isFinite(wage))return;
-      try{must(await db().rpc("make_transfer_offer",{p_player_id:b.dataset.ragOffer,p_amount:amount,p_weekly_wage:wage}),"MAKE_OFFER");toast("Offer dikirim.");await render();}catch(e){toast("Offer gagal: "+errText(e));}
-    });
-    S.content.querySelectorAll("[data-rag-upgrade]").forEach(b=>b.onclick=async()=>{
-      try{must(await db().rpc("upgrade_club_facility",{p_facility:b.dataset.ragUpgrade}),"UPGRADE");toast("Facility upgraded.");await render();}catch(e){toast("Upgrade gagal: "+errText(e));}
-    });
-    S.content.querySelectorAll("[data-rag-read]").forEach(b=>b.onclick=async()=>{
-      try{must(await db().rpc("mark_notification_read",{p_notification_id:b.dataset.ragRead}),"MARK_READ");await render();}catch(e){toast(errText(e));}
-    });
-    const all=document.getElementById("ragMarkAll");
-    if(all) all.onclick=async()=>{try{must(await db().rpc("mark_all_notifications_read",{p_category:null}),"MARK_ALL");await render();}catch(e){toast(errText(e));}};
-  }
-
-  function go(view){
-    if(S.channel){ try{db().removeChannel(S.channel)}catch{} S.channel=null; }
-    S.view=view;
-    S.root.querySelectorAll("[data-rag-view]").forEach(x=>x.classList.toggle("active",x.dataset.ragView===view));
-    const title=S.root.querySelector("#ragTitle"); if(title) title.textContent=({home:"Dashboard",squad:"Squad",tactics:"Tactics & Lineup",training:"Training",transfers:"Transfers",league:"League",match:"Match Centre",club:"Club & Finance",inbox:"Inbox"})[view]||view;
-    render();
-  }
-
-  async function mount(){
-    S.ctx=await context();
-    if(S.ctx.world.founding_draw_status!=="COMPLETED") throw new Error("Founding Draw belum COMPLETED.");
-    document.getElementById("authRoot").classList.add("is-hidden");
-    document.getElementById("gameApp").classList.add("is-hidden");
-    let root=document.getElementById("realAlphaRoot");
-    if(root) root.remove();
-    root=document.createElement("section"); root.id="realAlphaRoot";
-    root.innerHTML=`<div class="rag-shell">
-      <aside class="rag-side"><div class="rag-brand"><b>Football Manager Mini</b><small>${esc(S.ctx.club.name)}</small><span class="rag-badge">CLOSED ALPHA · REAL DATA</span></div>
-      <nav class="rag-nav">
-        ${[["home","Home"],["squad","Squad"],["tactics","Tactics"],["training","Training"],["transfers","Transfers"],["league","League"],["match","Match"],["club","Club"],["inbox","Inbox"]].map(([k,l])=>`<button data-rag-view="${k}" class="${k==="home"?"active":""}">${l}</button>`).join("")}
-      </nav><div class="rag-side-foot">Season ${esc(S.ctx.season.season_number)} · ${esc(S.ctx.season.phase)}<br>Server truth: Supabase Alpha</div></aside>
-      <main class="rag-main"><header class="rag-top"><div><h1 id="ragTitle">Dashboard</h1><p>${esc(S.ctx.profile.display_name||S.ctx.profile.username)} · ${esc(S.ctx.club.name)}</p></div><div class="rag-top-actions"><button class="rag-btn" id="ragRefresh">Refresh</button><button class="rag-btn danger" id="ragLogout">Logout</button></div></header><div class="rag-content" id="ragContent"></div></main>
-    </div><div class="rag-toast" id="ragToast"></div>`;
-    document.body.appendChild(root); S.root=root; S.content=root.querySelector("#ragContent");
-    root.querySelectorAll("[data-rag-view]").forEach(b=>b.onclick=()=>go(b.dataset.ragView));
-    root.querySelector("#ragRefresh").onclick=async()=>{S.ctx=await context();await render();toast("Refreshed from server.");};
-    root.querySelector("#ragLogout").onclick=async()=>{if(S.channel)try{db().removeChannel(S.channel)}catch{}; await window.AlphaService.signOut(); location.reload();};
-    await render();
-  }
-
-  return {mount,go};
-})();
-</script>
-
 </body>
 </html>
