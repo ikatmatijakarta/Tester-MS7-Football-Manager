@@ -2871,9 +2871,10 @@ window.GameService = (() => {
           <div class="alpha-stat"><span>Owned Players</span><strong>${squad.count}</strong></div>
           <div class="alpha-stat"><span>Draw Status</span><strong>${htmlSafe(world.founding_draw_status)}</strong></div>
         </div>
-        <div class="alpha-status-box"><strong>Onboarding Gate selesai untuk akun ini</strong><p>Build ini sengaja berhenti di sini. Gameplay screens masih MockDB dan belum boleh dipakai untuk Closed Alpha match test sampai bridge gameplay berikutnya terpasang.</p></div>
-        <div class="alpha-user-list">${(squad.players || []).slice(0,6).map(x=>`<div class="alpha-user-row"><div><strong>${htmlSafe(x.name || x.player_id)}</strong><span>${htmlSafe(x.primary_position || "")} · OVR ${htmlSafe(x.current_ovr)} · Tier ${htmlSafe(x.current_tier)}</span></div></div>`).join("")}</div>
-        <button class="primary-btn" id="refreshReadyBtn" type="button">Refresh Squad</button>
+        <div class="alpha-status-box"><strong>Onboarding Gate selesai untuk akun ini</strong><p>Real Gameplay Bridge V1 sudah tersedia. Semua 22 pemain tetap ada di server; daftar singkat di bawah hanya preview.</p></div>
+        <div class="alpha-user-list">${(squad.players || []).slice(0,6).map(x=>`<div class="alpha-user-row"><div><strong>${htmlSafe(x.name || x.player_id)}</strong><span>${htmlSafe(x.primary_position || "")} · OVR ${htmlSafe(x.current_ovr)} · Tier ${htmlSafe(x.current_tier)} · ${htmlSafe(x.reference_club || "")} ${htmlSafe(x.reference_season || "")}</span></div></div>`).join("")}</div>
+        <button class="primary-btn" id="enterRealGameplayBtn" type="button">ENTER REAL GAMEPLAY</button>
+        <button class="secondary-btn" id="refreshReadyBtn" style="width:100%;margin-top:8px" type="button">Refresh Squad</button>
         <button class="secondary-btn" id="readyLogoutBtn" style="width:100%;margin-top:8px" type="button">Logout</button>
       </div></div>`;
     }
@@ -3029,6 +3030,10 @@ window.GameService = (() => {
       document.getElementById("refreshDrawBtn")?.addEventListener("click", () => showAuth(true));
       document.getElementById("waitingLogoutBtn")?.addEventListener("click", alphaLogout);
     } else if (mode === "alphaReady") {
+      document.getElementById("enterRealGameplayBtn")?.addEventListener("click", async () => {
+        try { await window.RealAlphaGame.mount(); }
+        catch (err) { console.error(err); showToast(`Gameplay gagal dibuka: ${err.message || err}`); }
+      });
       document.getElementById("refreshReadyBtn")?.addEventListener("click", () => showAuth(true));
       document.getElementById("readyLogoutBtn")?.addEventListener("click", alphaLogout);
     } else if (mode === "adminLobby") {
@@ -5243,5 +5248,405 @@ window.GameService = (() => {
 })();
 
 </script>
+
+<style>
+/* ===========================
+   PHASE 20B - REAL GAMEPLAY BRIDGE V1
+   =========================== */
+#realAlphaRoot{position:fixed;inset:0;z-index:500;background:#07150d;color:#f7f9fc;overflow:auto}
+.rag-shell{min-height:100vh;display:grid;grid-template-columns:230px minmax(0,1fr)}
+.rag-side{position:sticky;top:0;height:100vh;padding:18px 14px;border-right:1px solid #244331;background:#06120c;display:flex;flex-direction:column;gap:14px}
+.rag-brand{padding:10px;border:1px solid #244331;border-radius:14px;background:#0a1d12}
+.rag-brand b{display:block;font-size:14px}.rag-brand small{color:#86a792}
+.rag-badge{display:inline-flex;margin-top:8px;padding:5px 8px;border-radius:999px;border:1px solid #5f7520;color:#d8ff70;font-size:9px;font-weight:900}
+.rag-nav{display:grid;gap:6px}
+.rag-nav button{min-height:42px;text-align:left;border:0;border-radius:10px;padding:0 11px;background:transparent;color:#99ad9f;font-weight:800}
+.rag-nav button:hover,.rag-nav button.active{background:#10331d;color:#cfff5e}
+.rag-side-foot{margin-top:auto;font-size:10px;color:#789082}
+.rag-main{min-width:0}
+.rag-top{position:sticky;top:0;z-index:5;display:flex;justify-content:space-between;gap:12px;align-items:center;padding:16px 22px;background:rgba(7,21,13,.94);border-bottom:1px solid #244331;backdrop-filter:blur(10px)}
+.rag-top h1{font-size:21px;margin:0}.rag-top p{margin:3px 0 0;font-size:10px;color:#8aa092}
+.rag-top-actions{display:flex;gap:8px;align-items:center}
+.rag-btn{min-height:38px;padding:0 12px;border-radius:10px;border:1px solid #315840;background:#0e2919;color:#eaf6ed;font-weight:800;cursor:pointer}
+.rag-btn.primary{background:#b7f52a;color:#102007;border-color:#b7f52a}
+.rag-btn.danger{border-color:#7f3340;color:#ff9baa;background:#261116}
+.rag-btn:disabled{opacity:.5;cursor:not-allowed}
+.rag-content{padding:22px;max-width:1500px;margin:auto}
+.rag-grid{display:grid;gap:14px}
+.rag-kpis{grid-template-columns:repeat(4,minmax(0,1fr));margin-bottom:14px}
+.rag-card{border:1px solid #244331;background:#0a1d12;border-radius:15px;padding:16px}
+.rag-card h2{font-size:15px;margin:0 0 10px}.rag-card h3{font-size:12px;margin:0 0 8px}
+.rag-muted{color:#8aa092;font-size:10px}
+.rag-kpi span{display:block;color:#86a792;font-size:9px;text-transform:uppercase}.rag-kpi strong{display:block;font-size:22px;margin-top:5px}
+.rag-table-wrap{overflow:auto;border:1px solid #244331;border-radius:13px}
+.rag-table{width:100%;border-collapse:collapse;min-width:780px}
+.rag-table th,.rag-table td{padding:10px 11px;border-bottom:1px solid #193624;font-size:10px;text-align:left}
+.rag-table th{font-size:9px;color:#7f9988;background:#08180f;position:sticky;top:0}
+.rag-pill{display:inline-flex;min-height:23px;align-items:center;padding:0 7px;border-radius:999px;border:1px solid #315840;font-size:9px;font-weight:900}
+.rag-pill.good{color:#84e69b;border-color:#326943}.rag-pill.warn{color:#ffd66a;border-color:#6e5c27}.rag-pill.bad{color:#ff99a7;border-color:#743744}
+.rag-form{display:flex;gap:8px;flex-wrap:wrap;align-items:end}
+.rag-field{display:grid;gap:5px;min-width:150px;flex:1}.rag-field label{font-size:9px;color:#86a792;font-weight:800}
+.rag-field input,.rag-field select{min-height:39px;border-radius:9px;border:1px solid #315840;background:#08180f;color:white;padding:0 10px}
+.rag-player-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.rag-player{padding:12px;border:1px solid #244331;border-radius:12px;background:#08180f}
+.rag-player-head{display:flex;justify-content:space-between;gap:10px}.rag-player strong{font-size:11px}.rag-player small{display:block;color:#8aa092;margin-top:3px}
+.rag-ovr{min-width:35px;height:35px;border-radius:50%;display:grid;place-items:center;background:#143722;border:1px solid #4d7a5c;color:#cfff5e;font-weight:900}
+.rag-hist{margin-top:9px;padding-top:8px;border-top:1px solid #193624;font-size:9px;color:#9aafa0;line-height:1.55}
+.rag-xi{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.rag-xi-row{padding:9px;border:1px solid #244331;border-radius:10px;background:#08180f;font-size:10px}
+.rag-note{padding:11px;border:1px solid #4e5d23;border-radius:10px;background:#1b230d;color:#d6e891;font-size:10px;line-height:1.5}
+.rag-error{padding:11px;border:1px solid #743744;border-radius:10px;background:#261116;color:#ffb0bb;font-size:10px;white-space:pre-wrap}
+.rag-success{padding:11px;border:1px solid #326943;border-radius:10px;background:#0e2b19;color:#9be9ac;font-size:10px}
+.rag-two{grid-template-columns:minmax(0,1.25fr) minmax(300px,.75fr)}
+.rag-list{display:grid;gap:8px}.rag-list-row{padding:10px;border:1px solid #244331;border-radius:10px;background:#08180f;display:flex;justify-content:space-between;gap:10px;align-items:center}
+.rag-list-row b{font-size:10px}.rag-list-row small{display:block;color:#8aa092;margin-top:3px}
+.rag-live-event{display:grid;grid-template-columns:42px minmax(0,1fr);gap:8px;padding:7px 0;border-bottom:1px solid #193624;font-size:10px}
+.rag-toast{position:fixed;right:18px;bottom:18px;z-index:600;padding:11px 14px;border-radius:10px;background:#0e2919;border:1px solid #4d7a5c;opacity:0;transform:translateY(8px);transition:.2s;max-width:360px;font-size:10px}
+.rag-toast.show{opacity:1;transform:none}
+@media(max-width:1050px){.rag-player-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.rag-two{grid-template-columns:1fr}.rag-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:760px){.rag-shell{grid-template-columns:1fr}.rag-side{position:static;height:auto}.rag-nav{grid-template-columns:repeat(4,minmax(0,1fr))}.rag-nav button{text-align:center;padding:0 4px;font-size:9px}.rag-side-foot{display:none}.rag-top{padding:12px 14px}.rag-content{padding:14px}.rag-player-grid{grid-template-columns:1fr}.rag-kpis{grid-template-columns:1fr 1fr}.rag-xi{grid-template-columns:1fr}}
+</style>
+
+<script>
+window.RealAlphaGame = (() => {
+  const db = () => window.AlphaService.client;
+  const S = {ctx:null, view:"home", root:null, content:null, channel:null, cache:{}};
+
+  const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  const money = n => "£" + Number(n || 0).toLocaleString("en-GB");
+  const fmtDate = v => v ? new Intl.DateTimeFormat("id-ID",{dateStyle:"medium",timeStyle:v.includes?.("T")?"short":undefined,timeZone:"Asia/Jakarta"}).format(new Date(v)) : "—";
+  const errText = e => [e?.message,e?.details,e?.hint,e?.code].filter(Boolean).join(" · ") || String(e);
+  function toast(msg){ let t=document.getElementById("ragToast"); if(!t)return; t.textContent=msg;t.classList.add("show");clearTimeout(toast.t);toast.t=setTimeout(()=>t.classList.remove("show"),2600); }
+  function must({data,error}, label){ if(error){const e=new Error(error.message||label);e.details=error.details;e.hint=error.hint;e.code=error.code;throw e;} return data; }
+  function card(title, body, extra=""){ return `<section class="rag-card ${extra}"><h2>${esc(title)}</h2>${body}</section>`; }
+
+  async function context(){
+    const session=await window.AlphaService.getSession();
+    if(!session?.user) throw new Error("Session Alpha tidak ditemukan.");
+    const profile=await window.AlphaService.getProfile(session.user.id);
+    const world=await window.AlphaService.getWorld();
+    const club=await window.AlphaService.getMyClub(session.user.id);
+    if(!club) throw new Error("Club belum dibuat.");
+    const seasonRows=must(await db().from("seasons").select("*").eq("world_id",world.id).eq("season_number",world.current_season_number).limit(1),"SEASON");
+    const season=seasonRows?.[0];
+    if(!season) throw new Error("Current season tidak ditemukan.");
+    return {session,profile,world,club,season};
+  }
+
+  async function squad(){
+    const club=S.ctx.club;
+    const states=must(await db().from("player_state").select("player_id,current_age,current_ovr,current_tier,fitness,form,retirement_risk").eq("current_club_id",club.id).eq("ownership_status","owned").order("current_ovr",{ascending:false}),"SQUAD_STATE")||[];
+    if(!states.length) return [];
+    const ids=states.map(x=>x.player_id);
+    const [pRes,cRes,rRes]=await Promise.all([
+      db().from("players").select("id,name,primary_position,secondary_positions,reference_season,reference_club,reference_age,potential_label").in("id",ids),
+      db().from("contracts").select("player_id,seasons_remaining,weekly_wage,status,renewal_seasons,renewal_weekly_wage").eq("club_id",club.id).eq("status","active"),
+      db().from("player_reference_attributes").select("player_id,reference_season,reference_club,reference_age").in("player_id",ids)
+    ]);
+    const players=must(pRes,"PLAYERS")||[], contracts=must(cRes,"CONTRACTS")||[], refs=must(rRes,"REFS")||[];
+    const pm=new Map(players.map(x=>[x.id,x])), cm=new Map(contracts.map(x=>[x.player_id,x])), rm=new Map(refs.map(x=>[x.player_id,x]));
+    return states.map(x=>({...x,...(pm.get(x.player_id)||{}),contract:cm.get(x.player_id)||null,reference:rm.get(x.player_id)||null}));
+  }
+
+  async function clubFinance(){
+    const [cs,fac,ledger]=await Promise.all([
+      db().from("club_seasons").select("*").eq("club_id",S.ctx.club.id).eq("season_id",S.ctx.season.id).maybeSingle(),
+      db().from("club_facilities").select("*").eq("club_id",S.ctx.club.id).maybeSingle(),
+      db().from("finance_ledger").select("*").eq("club_id",S.ctx.club.id).eq("season_id",S.ctx.season.id).order("created_at",{ascending:false}).limit(12)
+    ]);
+    return {season:must(cs,"CLUB_FINANCE"),facilities:must(fac,"FACILITIES"),ledger:must(ledger,"LEDGER")||[]};
+  }
+
+  async function fixtures(){
+    const rows=must(await db().from("league_fixtures").select("*").eq("season_id",S.ctx.season.id).order("matchday").order("scheduled_kickoff"),"FIXTURES")||[];
+    const clubIds=[...new Set(rows.flatMap(x=>[x.home_club_id,x.away_club_id]))];
+    const clubs=clubIds.length?must(await db().from("clubs").select("id,name,short_name").in("id",clubIds),"FIXTURE_CLUBS")||[]:[];
+    const cm=new Map(clubs.map(x=>[x.id,x]));
+    return rows.map(x=>({...x,home:cm.get(x.home_club_id),away:cm.get(x.away_club_id)}));
+  }
+
+  async function standings(){
+    const st=must(await db().from("league_standings").select("*").eq("season_id",S.ctx.season.id).order("position",{ascending:true}),"STANDINGS")||[];
+    const ids=st.map(x=>x.club_id);
+    const clubs=ids.length?must(await db().from("clubs").select("id,name,short_name").in("id",ids),"STANDING_CLUBS")||[]:[];
+    const cm=new Map(clubs.map(x=>[x.id,x]));
+    return st.map(x=>({...x,club:cm.get(x.club_id)}));
+  }
+
+  async function notificationFeed(){
+    const d=must(await db().rpc("notification_feed",{p_category:null,p_unread_only:false,p_limit:50,p_before:null}),"NOTIFICATIONS");
+    return d||[];
+  }
+
+  async function renderHome(){
+    const [sq,fin,fx,notes]=await Promise.all([squad(),clubFinance(),fixtures(),notificationFeed()]);
+    const next=fx.find(x=>["scheduled","lineup_locked","live"].includes(x.status) && (x.home_club_id===S.ctx.club.id||x.away_club_id===S.ctx.club.id));
+    const unread=notes.filter(x=>!x.is_read).length;
+    return `
+      <div class="rag-grid rag-kpis">
+        ${card("Squad",`<div class="rag-kpi"><span>Owned Players</span><strong>${sq.length}/22</strong></div>`)}
+        ${card("Season",`<div class="rag-kpi"><span>Phase</span><strong>${esc(S.ctx.season.phase)}</strong></div>`)}
+        ${card("Balance",`<div class="rag-kpi"><span>Club Cash</span><strong style="font-size:16px">${money(fin.season?.balance)}</strong></div>`)}
+        ${card("Inbox",`<div class="rag-kpi"><span>Unread</span><strong>${unread}</strong></div>`)}
+      </div>
+      <div class="rag-grid rag-two">
+        ${card("Next Match", next ? `<div class="rag-list-row"><div><b>MD${next.matchday} · ${esc(next.home?.name)} vs ${esc(next.away?.name)}</b><small>${fmtDate(next.scheduled_kickoff)} · ${esc(next.status)}</small></div><button class="rag-btn" data-rag-go="match">Match Centre</button></div>` : `<p class="rag-muted">Belum ada fixture berikutnya. Scheduler tetap OFF sampai calendar Alpha disetujui.</p>`)}
+        ${card("World State",`<div class="rag-list"><div class="rag-list-row"><b>Founding Draw</b><span class="rag-pill good">${esc(S.ctx.world.founding_draw_status)}</span></div><div class="rag-list-row"><b>Transfer Window</b><span class="rag-pill ${S.ctx.world.transfer_window_open?"good":"warn"}">${S.ctx.world.transfer_window_open?"OPEN":"CLOSED"}</span></div><div class="rag-list-row"><b>Scheduler</b><span class="rag-pill ${S.ctx.world.scheduler_enabled?"good":"warn"}">${S.ctx.world.scheduler_enabled?"ON":"OFF"}</span></div></div>`)}
+      </div>`;
+  }
+
+  async function renderSquad(){
+    const sq=await squad();
+    return `${card("Real Squad · Semua pemain dari server",`
+      <div class="rag-note">Historical identity ditampilkan di Alpha bridge ini: Reference Club, Reference Season, dan Reference Age. Jumlah di bawah berasal langsung dari <code>player_state</code>.</div>
+      <div style="height:10px"></div>
+      <div class="rag-player-grid">${sq.map(p=>`<article class="rag-player">
+        <div class="rag-player-head"><div><strong>${esc(p.name||p.player_id)}</strong><small>${esc(p.primary_position)} · Tier ${esc(p.current_tier)} · Age ${esc(p.current_age)}</small></div><div class="rag-ovr">${esc(p.current_ovr)}</div></div>
+        <div class="rag-hist"><b>Historical Reference</b><br>Club: ${esc(p.reference?.reference_club||p.reference_club||"—")}<br>Season: ${esc(p.reference?.reference_season||p.reference_season||"—")} · Reference Age: ${esc(p.reference?.reference_age??p.reference_age??"—")}<br>Fitness ${esc(p.fitness)} · Form ${esc(p.form)}<br>Contract: ${esc(p.contract?.seasons_remaining??"—")} season · ${money(p.contract?.weekly_wage||0)}/week</div>
+      </article>`).join("")}</div>`)}
+    `;
+  }
+
+  async function renderTactics(){
+    const [sq,forms,tac,lineup,ratings]=await Promise.all([
+      squad(),
+      db().from("formation_templates").select("*").order("code"),
+      db().from("club_tactics").select("*").eq("club_id",S.ctx.club.id).eq("season_id",S.ctx.season.id).maybeSingle(),
+      db().from("club_lineup_entries").select("*").eq("club_id",S.ctx.club.id).eq("season_id",S.ctx.season.id).order("role").order("slot_index"),
+      (async()=>{ const ids=(await squad()).map(x=>x.player_id); return ids.length?db().from("player_position_ratings").select("player_id,position,position_ovr,familiarity").in("player_id",ids):{data:[],error:null}; })()
+    ]);
+    const f=must(forms,"FORMATIONS")||[], t=must(tac,"TACTICS"), le=must(lineup,"LINEUP")||[], pr=must(ratings,"POSITION_RATINGS")||[];
+    S.cache.tactics={sq,f,t,le,pr};
+    const current=t?.formation_code||f[0]?.code||"4-3-3";
+    const select=(id,label,vals,val)=>`<div class="rag-field"><label>${label}</label><select id="${id}">${vals.map(x=>`<option ${x===val?"selected":""}>${esc(x)}</option>`).join("")}</select></div>`;
+    return `
+      <div class="rag-grid rag-two">
+      ${card("Formation & XI",`
+        <div class="rag-form"><div class="rag-field"><label>Formation</label><select id="ragFormation">${f.map(x=>`<option value="${esc(x.code)}" ${x.code===current?"selected":""}>${esc(x.display_name||x.code)}</option>`).join("")}</select></div><button class="rag-btn primary" id="ragAutoLineup">Auto Pick & Save XI</button></div>
+        <div style="height:12px"></div>
+        <div class="rag-xi">${le.length?le.map(x=>{const p=sq.find(q=>q.player_id===x.player_id);return `<div class="rag-xi-row"><b>${x.role==="starter"?`${x.slot_index}. ${esc(x.tactical_position)}`:`Bench ${x.slot_index}`}</b> · ${esc(p?.name||x.player_id)}</div>`}).join(""):`<p class="rag-muted">Belum ada lineup server-side. Gunakan Auto Pick & Save XI.</p>`}</div>
+      `)}
+      ${card("Team Tactics",`
+        <div class="rag-form">
+        ${select("ragMentality","Mentality",["Defensive","Cautious","Balanced","Positive","Attacking"],t?.mentality||"Balanced")}
+        ${select("ragPress","Press",["Low Block","Standard","High Press"],t?.press||"Standard")}
+        ${select("ragLine","Defensive Line",["Low","Standard","High"],t?.defensive_line||"Standard")}
+        ${select("ragTempo","Tempo",["Slow","Balanced","Fast"],t?.tempo||"Balanced")}
+        ${select("ragPassing","Passing",["Short","Mixed","Direct"],t?.passing_style||"Mixed")}
+        ${select("ragWidth","Width",["Narrow","Balanced","Wide"],t?.width||"Balanced")}
+        ${select("ragFocus","Focus",["Left","Balanced","Right","Central"],t?.focus||"Balanced")}
+        ${select("ragTransition","Transition",["Hold","Balanced","Counter"],t?.transition||"Balanced")}
+        </div><button class="rag-btn primary" id="ragSaveTactics" style="margin-top:12px">Save Real Tactics</button>
+      `)}
+      </div>`;
+  }
+
+  function pickLineup(formationCode){
+    const c=S.cache.tactics, form=c.f.find(x=>x.code===formationCode);
+    if(!form) throw new Error("Formation tidak ditemukan.");
+    const slots=form.starter_slots||[];
+    const used=new Set(), starters=[];
+    for(const pos of slots){
+      const ranked=c.sq.filter(p=>!used.has(p.player_id)).map(p=>{
+        const r=c.pr.find(x=>x.player_id===p.player_id&&String(x.position).toUpperCase()===String(pos).toUpperCase());
+        return {p,score:Number(r?.position_ovr??0)*10+Number(r?.familiarity??0)+Number(p.current_ovr||0)};
+      }).sort((a,b)=>b.score-a.score);
+      if(!ranked.length||ranked[0].score<=0) throw new Error(`Tidak ada pemain valid untuk slot ${pos}.`);
+      used.add(ranked[0].p.player_id); starters.push({player_id:ranked[0].p.player_id,position:String(pos).toUpperCase()});
+    }
+    const bench=c.sq.filter(p=>!used.has(p.player_id)).sort((a,b)=>b.current_ovr-a.current_ovr).slice(0,9).map(p=>({player_id:p.player_id}));
+    return {starters,bench};
+  }
+
+  async function renderTraining(){
+    const rows=must(await db().from("training_sessions").select("*").eq("club_id",S.ctx.club.id).eq("season_id",S.ctx.season.id).order("training_date",{ascending:false}).limit(12),"TRAINING")||[];
+    const types=["Recovery","Light","Normal","Intensive","Attacking","Defensive","Technical","Fitness"];
+    return `<div class="rag-grid rag-two">
+      ${card("Schedule Training",`<div class="rag-note">Backend menjaga unique 1 session/club/day. Scheduling di sini real; permanent growth tetap diproses server-side.</div><div class="rag-form" style="margin-top:12px"><div class="rag-field"><label>Session</label><select id="ragTrainingType">${types.map(x=>`<option>${x}</option>`).join("")}</select></div><div class="rag-field"><label>Date</label><input id="ragTrainingDate" type="date"></div><button class="rag-btn primary" id="ragScheduleTraining">Schedule</button></div>`)}
+      ${card("Training History",`<div class="rag-list">${rows.length?rows.map(x=>`<div class="rag-list-row"><div><b>${esc(x.training_date)} · ${esc(x.session_type)}</b><small>Status ${esc(x.status)} · Players ${esc(x.players_processed)} · DXP ${esc(x.total_effective_dxp)}</small></div><span class="rag-pill ${x.status==="completed"?"good":"warn"}">${esc(x.status)}</span></div>`).join(""):`<p class="rag-muted">Belum ada training session.</p>`}</div>`)}
+    </div>`;
+  }
+
+  async function renderTransfers(){
+    const [sq,listings,offers,clubs]=await Promise.all([
+      squad(),
+      db().from("transfer_listings").select("*").eq("status","listed").order("listed_at",{ascending:false}).limit(80),
+      db().from("transfer_offers").select("*").or(`buyer_club_id.eq.${S.ctx.club.id},seller_club_id.eq.${S.ctx.club.id}`).order("created_at",{ascending:false}).limit(50),
+      db().from("clubs").select("id,name,short_name").eq("world_id",S.ctx.world.id)
+    ]);
+    const ls=must(listings,"LISTINGS")||[], os=must(offers,"OFFERS")||[], cs=must(clubs,"CLUBS")||[];
+    const ids=[...new Set(ls.map(x=>x.player_id))];
+    const ps=ids.length?must(await db().from("players").select("id,name,primary_position,reference_club,reference_season").in("id",ids),"MARKET_PLAYERS")||[]:[];
+    const pm=new Map(ps.map(x=>[x.id,x])), cm=new Map(cs.map(x=>[x.id,x]));
+    return `
+      <div class="rag-grid rag-two">
+      ${card(`Transfer Market · ${S.ctx.world.transfer_window_open?"OPEN":"CLOSED"}`,`
+        <div class="rag-list">${ls.filter(x=>x.seller_club_id!==S.ctx.club.id).length?ls.filter(x=>x.seller_club_id!==S.ctx.club.id).map(x=>{const p=pm.get(x.player_id);return `<div class="rag-list-row"><div><b>${esc(p?.name||x.player_id)} · ${esc(p?.primary_position||"")}</b><small>${esc(cm.get(x.seller_club_id)?.name||"")} · Ask ${money(x.asking_price)} · ${esc(p?.reference_club||"")} ${esc(p?.reference_season||"")}</small></div><button class="rag-btn" data-rag-offer="${esc(x.player_id)}">Make Offer</button></div>`}).join(""):`<p class="rag-muted">Tidak ada listing klub lain saat ini.</p>`}</div>
+      `)}
+      ${card("List My Player",`<div class="rag-form"><div class="rag-field"><label>Player</label><select id="ragListPlayer">${sq.map(p=>`<option value="${esc(p.player_id)}">${esc(p.name)} · ${esc(p.primary_position)}</option>`).join("")}</select></div><div class="rag-field"><label>Asking Price (£)</label><input id="ragAskPrice" type="number" min="0" value="10000000"></div><button class="rag-btn primary" id="ragListBtn">List Player</button></div>`)}
+      </div>
+      ${card("My Offers",`<div class="rag-table-wrap"><table class="rag-table"><thead><tr><th>Player</th><th>Direction</th><th>Amount</th><th>Wage</th><th>Status</th></tr></thead><tbody>${os.length?os.map(o=>`<tr><td>${esc(o.player_id)}</td><td>${o.buyer_club_id===S.ctx.club.id?"BUY":"SELL"}</td><td>${money(o.buyer_amount)}</td><td>${money(o.proposed_weekly_wage)}/w</td><td>${esc(o.status)}</td></tr>`).join(""):`<tr><td colspan="5">Belum ada offer.</td></tr>`}</tbody></table></div>`)}
+    `;
+  }
+
+  async function renderLeague(){
+    const [st,fx]=await Promise.all([standings(),fixtures()]);
+    return `
+      ${card("League Standings",`<div class="rag-table-wrap"><table class="rag-table"><thead><tr><th>#</th><th>Club</th><th>P</th><th>W</th><th>D</th><th>L</th><th>GF</th><th>GA</th><th>GD</th><th>Pts</th></tr></thead><tbody>${st.length?st.map(x=>`<tr><td>${esc(x.position??"—")}</td><td>${esc(x.club?.name||x.club_id)}</td><td>${x.played}</td><td>${x.won}</td><td>${x.drawn}</td><td>${x.lost}</td><td>${x.goals_for}</td><td>${x.goals_against}</td><td>${x.goal_difference}</td><td><b>${x.points}</b></td></tr>`).join(""):`<tr><td colspan="10">Standings belum dibuat / fixture belum dimulai.</td></tr>`}</tbody></table></div>`)}
+      <div style="height:14px"></div>
+      ${card("Fixtures",`<div class="rag-list">${fx.length?fx.map(x=>`<div class="rag-list-row"><div><b>MD${x.matchday} · ${esc(x.home?.name)} vs ${esc(x.away?.name)}</b><small>${fmtDate(x.scheduled_kickoff)} · ${esc(x.status)} · Leg ${x.leg}</small></div><span class="rag-pill ${x.status==="completed"?"good":"warn"}">${esc(x.status)}</span></div>`).join(""):`<p class="rag-muted">Belum ada fixtures.</p>`}</div>`)}
+    `;
+  }
+
+  async function renderClub(){
+    const f=await clubFinance();
+    return `
+      <div class="rag-grid rag-kpis">
+       ${card("Balance",`<div class="rag-kpi"><span>Cash</span><strong style="font-size:16px">${money(f.season?.balance)}</strong></div>`)}
+       ${card("Transfer Budget",`<div class="rag-kpi"><span>Available</span><strong style="font-size:16px">${money(f.season?.transfer_budget)}</strong></div>`)}
+       ${card("Weekly Wage",`<div class="rag-kpi"><span>${money(f.season?.weekly_wage_committed)} / ${money(f.season?.wage_limit_weekly)}</span><strong>${Math.round(100*(f.season?.weekly_wage_committed||0)/(f.season?.wage_limit_weekly||1))}%</strong></div>`)}
+       ${card("Sponsor",`<div class="rag-kpi"><span>Season Value</span><strong style="font-size:16px">${money(f.season?.sponsor_value)}</strong></div>`)}
+      </div>
+      <div class="rag-grid rag-two">
+      ${card("Facilities",`<div class="rag-list">
+        ${["training","medical","stadium"].map(k=>`<div class="rag-list-row"><div><b>${k[0].toUpperCase()+k.slice(1)} Facility</b><small>Level ${esc(f.facilities?.[k+"_level"]??"—")} / 5</small></div><button class="rag-btn" data-rag-upgrade="${k}" ${(f.facilities?.[k+"_level"]||5)>=5?"disabled":""}>Upgrade</button></div>`).join("")}
+      </div>`)}
+      ${card("Recent Ledger",`<div class="rag-list">${f.ledger.length?f.ledger.map(x=>`<div class="rag-list-row"><div><b>${esc(x.category)}</b><small>${esc(x.detail)} · ${fmtDate(x.created_at)}</small></div><b>${x.amount>=0?"+":""}${money(x.amount)}</b></div>`).join(""):`<p class="rag-muted">Belum ada ledger.</p>`}</div>`)}
+      </div>`;
+  }
+
+  async function renderInbox(){
+    const notes=await notificationFeed();
+    return `${card("In-App Notifications",`<div style="display:flex;justify-content:flex-end;margin-bottom:10px"><button class="rag-btn" id="ragMarkAll">Mark All Read</button></div><div class="rag-list">${notes.length?notes.map(n=>`<div class="rag-list-row"><div><b>${esc(n.title)}</b><small>${esc(n.category)} · ${esc(n.body)} · ${fmtDate(n.created_at)}</small></div>${n.is_read?'<span class="rag-pill">READ</span>':`<button class="rag-btn" data-rag-read="${esc(n.id)}">Mark Read</button>`}</div>`).join(""):`<p class="rag-muted">Belum ada notification.</p>`}</div>`)}
+    `;
+  }
+
+  async function renderMatch(){
+    const fx=await fixtures();
+    const mine=fx.filter(x=>x.home_club_id===S.ctx.club.id||x.away_club_id===S.ctx.club.id);
+    const live=mine.find(x=>x.status==="live") || mine.find(x=>["scheduled","lineup_locked"].includes(x.status)) || mine.slice(-1)[0];
+    if(!live) return card("Match Centre",`<p class="rag-muted">Belum ada fixture untuk klub ini.</p>`);
+    const [sess,events]=await Promise.all([
+      db().from("live_match_sessions").select("*").eq("fixture_id",live.id).maybeSingle(),
+      db().from("live_match_events").select("*").eq("fixture_id",live.id).order("sequence",{ascending:false}).limit(40)
+    ]);
+    const s=must(sess,"LIVE_SESSION"), ev=must(events,"LIVE_EVENTS")||[];
+    if(s && !S.channel){
+      S.channel=db().channel(`alpha-live-${live.id}`)
+        .on("postgres_changes",{event:"*",schema:"public",table:"live_match_sessions",filter:`fixture_id=eq.${live.id}`},()=>render())
+        .on("postgres_changes",{event:"INSERT",schema:"public",table:"live_match_events",filter:`fixture_id=eq.${live.id}`},()=>render())
+        .subscribe();
+    }
+    return `
+      ${card("Match Centre",`<div class="rag-list-row"><div><b>${esc(live.home?.name)} vs ${esc(live.away?.name)}</b><small>MD${live.matchday} · ${fmtDate(live.scheduled_kickoff)} · ${esc(live.status)}</small></div>${s?`<div><b>${s.home_score} - ${s.away_score}</b><small>${s.match_minute}' · Tick ${s.current_tick}/${s.total_ticks}</small></div>`:""}</div>`)}
+      <div style="height:14px"></div>
+      ${card("Live Events",`<div>${ev.length?ev.slice().reverse().map(e=>`<div class="rag-live-event"><b>${e.match_minute}'</b><span>${esc(e.event_type)} · ${esc(e.player_id||"")}${e.xg!=null?` · xG ${esc(e.xg)}`:""}</span></div>`).join(""):`<p class="rag-muted">Belum ada live events. Realtime akan aktif ketika fixture berstatus live.</p>`}</div>`)}
+    `;
+  }
+
+  async function render(){
+    if(!S.content)return;
+    S.content.innerHTML=`<div class="rag-card"><p class="rag-muted">Loading real server data...</p></div>`;
+    try{
+      let out="";
+      if(S.view==="home") out=await renderHome();
+      else if(S.view==="squad") out=await renderSquad();
+      else if(S.view==="tactics") out=await renderTactics();
+      else if(S.view==="training") out=await renderTraining();
+      else if(S.view==="transfers") out=await renderTransfers();
+      else if(S.view==="league") out=await renderLeague();
+      else if(S.view==="match") out=await renderMatch();
+      else if(S.view==="club") out=await renderClub();
+      else if(S.view==="inbox") out=await renderInbox();
+      S.content.innerHTML=out;
+      wire();
+    }catch(e){console.error(e);S.content.innerHTML=`<div class="rag-error"><b>Server/API error</b><br>${esc(errText(e))}</div>`;}
+  }
+
+  function wire(){
+    S.content.querySelectorAll("[data-rag-go]").forEach(b=>b.onclick=()=>go(b.dataset.ragGo));
+    const auto=document.getElementById("ragAutoLineup");
+    if(auto) auto.onclick=async()=>{
+      try{
+        auto.disabled=true;
+        const formation=document.getElementById("ragFormation").value;
+        const {starters,bench}=pickLineup(formation);
+        must(await db().rpc("save_lineup",{p_formation_code:formation,p_starters:starters,p_bench:bench}),"SAVE_LINEUP");
+        toast("Lineup server-side tersimpan."); await render();
+      }catch(e){toast("Lineup gagal: "+errText(e));auto.disabled=false;}
+    };
+    const saveTac=document.getElementById("ragSaveTactics");
+    if(saveTac) saveTac.onclick=async()=>{
+      try{
+        saveTac.disabled=true;
+        const g=id=>document.getElementById(id).value;
+        must(await db().rpc("save_tactics",{p_formation_code:g("ragFormation"),p_mentality:g("ragMentality"),p_press:g("ragPress"),p_defensive_line:g("ragLine"),p_tempo:g("ragTempo"),p_passing_style:g("ragPassing"),p_width:g("ragWidth"),p_focus:g("ragFocus"),p_transition:g("ragTransition"),p_auto_sub_enabled:true}),"SAVE_TACTICS");
+        toast("Tactics server-side tersimpan."); await render();
+      }catch(e){toast("Tactics gagal: "+errText(e));saveTac.disabled=false;}
+    };
+    const tr=document.getElementById("ragScheduleTraining");
+    if(tr) tr.onclick=async()=>{
+      try{
+        tr.disabled=true; const typ=document.getElementById("ragTrainingType").value; const dt=document.getElementById("ragTrainingDate").value||null;
+        must(await db().rpc("schedule_training",{p_session_type:typ,p_training_date:dt}),"SCHEDULE_TRAINING");
+        toast("Training tersimpan."); await render();
+      }catch(e){toast("Training gagal: "+errText(e));tr.disabled=false;}
+    };
+    const lb=document.getElementById("ragListBtn");
+    if(lb) lb.onclick=async()=>{
+      try{
+        const pid=document.getElementById("ragListPlayer").value, ask=Number(document.getElementById("ragAskPrice").value);
+        must(await db().rpc("list_player_for_transfer",{p_player_id:pid,p_asking_price:ask}),"LIST_PLAYER");
+        toast("Player listed."); await render();
+      }catch(e){toast("Listing gagal: "+errText(e));}
+    };
+    S.content.querySelectorAll("[data-rag-offer]").forEach(b=>b.onclick=async()=>{
+      const amount=Number(prompt("Transfer fee (£):","10000000")); if(!Number.isFinite(amount))return;
+      const wage=Number(prompt("Proposed weekly wage (£):","50000")); if(!Number.isFinite(wage))return;
+      try{must(await db().rpc("make_transfer_offer",{p_player_id:b.dataset.ragOffer,p_amount:amount,p_weekly_wage:wage}),"MAKE_OFFER");toast("Offer dikirim.");await render();}catch(e){toast("Offer gagal: "+errText(e));}
+    });
+    S.content.querySelectorAll("[data-rag-upgrade]").forEach(b=>b.onclick=async()=>{
+      try{must(await db().rpc("upgrade_club_facility",{p_facility:b.dataset.ragUpgrade}),"UPGRADE");toast("Facility upgraded.");await render();}catch(e){toast("Upgrade gagal: "+errText(e));}
+    });
+    S.content.querySelectorAll("[data-rag-read]").forEach(b=>b.onclick=async()=>{
+      try{must(await db().rpc("mark_notification_read",{p_notification_id:b.dataset.ragRead}),"MARK_READ");await render();}catch(e){toast(errText(e));}
+    });
+    const all=document.getElementById("ragMarkAll");
+    if(all) all.onclick=async()=>{try{must(await db().rpc("mark_all_notifications_read",{p_category:null}),"MARK_ALL");await render();}catch(e){toast(errText(e));}};
+  }
+
+  function go(view){
+    if(S.channel){ try{db().removeChannel(S.channel)}catch{} S.channel=null; }
+    S.view=view;
+    S.root.querySelectorAll("[data-rag-view]").forEach(x=>x.classList.toggle("active",x.dataset.ragView===view));
+    const title=S.root.querySelector("#ragTitle"); if(title) title.textContent=({home:"Dashboard",squad:"Squad",tactics:"Tactics & Lineup",training:"Training",transfers:"Transfers",league:"League",match:"Match Centre",club:"Club & Finance",inbox:"Inbox"})[view]||view;
+    render();
+  }
+
+  async function mount(){
+    S.ctx=await context();
+    if(S.ctx.world.founding_draw_status!=="COMPLETED") throw new Error("Founding Draw belum COMPLETED.");
+    document.getElementById("authRoot").classList.add("is-hidden");
+    document.getElementById("gameApp").classList.add("is-hidden");
+    let root=document.getElementById("realAlphaRoot");
+    if(root) root.remove();
+    root=document.createElement("section"); root.id="realAlphaRoot";
+    root.innerHTML=`<div class="rag-shell">
+      <aside class="rag-side"><div class="rag-brand"><b>Football Manager Mini</b><small>${esc(S.ctx.club.name)}</small><span class="rag-badge">CLOSED ALPHA · REAL DATA</span></div>
+      <nav class="rag-nav">
+        ${[["home","Home"],["squad","Squad"],["tactics","Tactics"],["training","Training"],["transfers","Transfers"],["league","League"],["match","Match"],["club","Club"],["inbox","Inbox"]].map(([k,l])=>`<button data-rag-view="${k}" class="${k==="home"?"active":""}">${l}</button>`).join("")}
+      </nav><div class="rag-side-foot">Season ${esc(S.ctx.season.season_number)} · ${esc(S.ctx.season.phase)}<br>Server truth: Supabase Alpha</div></aside>
+      <main class="rag-main"><header class="rag-top"><div><h1 id="ragTitle">Dashboard</h1><p>${esc(S.ctx.profile.display_name||S.ctx.profile.username)} · ${esc(S.ctx.club.name)}</p></div><div class="rag-top-actions"><button class="rag-btn" id="ragRefresh">Refresh</button><button class="rag-btn danger" id="ragLogout">Logout</button></div></header><div class="rag-content" id="ragContent"></div></main>
+    </div><div class="rag-toast" id="ragToast"></div>`;
+    document.body.appendChild(root); S.root=root; S.content=root.querySelector("#ragContent");
+    root.querySelectorAll("[data-rag-view]").forEach(b=>b.onclick=()=>go(b.dataset.ragView));
+    root.querySelector("#ragRefresh").onclick=async()=>{S.ctx=await context();await render();toast("Refreshed from server.");};
+    root.querySelector("#ragLogout").onclick=async()=>{if(S.channel)try{db().removeChannel(S.channel)}catch{}; await window.AlphaService.signOut(); location.reload();};
+    await render();
+  }
+
+  return {mount,go};
+})();
+</script>
+
 </body>
 </html>
